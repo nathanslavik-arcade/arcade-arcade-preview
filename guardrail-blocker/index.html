@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>GUARDRAIL BLOCKER</title>
+<style>
+  :root { --bezel:#15121f; --glow:#4fd1ff; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body {
+    height:100%; background:#05040d; overflow:hidden;
+    font-family:"Courier New",monospace; color:#cfd8ff;
+    display:flex; align-items:center; justify-content:center;
+    touch-action:none; user-select:none; -webkit-user-select:none;
+  }
+  #cabinet {
+    position:relative; padding:14px; border-radius:18px;
+    background:linear-gradient(180deg,#241d34,#100c1c);
+    box-shadow:0 0 0 2px #372b52, 0 30px 70px rgba(0,0,0,.8), 0 0 90px rgba(79,209,255,.10);
+  }
+  #wrap { position:relative; line-height:0; border-radius:8px; overflow:hidden; }
+  canvas {
+    display:block; image-rendering:pixelated; background:#07061a;
+    height:min(94vh, 720px); width:auto;
+  }
+  /* CRT scanlines + vignette */
+  #wrap::after {
+    content:""; position:absolute; inset:0; pointer-events:none;
+    background:
+      repeating-linear-gradient(0deg, rgba(0,0,0,.26) 0 1px, rgba(0,0,0,0) 1px 3px),
+      radial-gradient(120% 100% at 50% 50%, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%);
+    mix-blend-mode:multiply;
+  }
+  #marquee {
+    text-align:center; letter-spacing:.42em; font-size:11px; font-weight:bold;
+    color:#7f6fb8; padding:0 0 10px 2px; text-transform:uppercase;
+  }
+</style>
+</head>
+<body>
+<div id="cabinet">
+  <div id="marquee">Guardrail Blocker</div>
+  <div id="wrap"><canvas id="game" width="480" height="720"></canvas></div>
+</div>
+<script>
+(() => {
+"use strict";
+
+/* ────────────────────────── setup ────────────────────────── */
+const W = 480, H = 720;
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const HI_KEY = "arcadeBlocker.hiscore";
+// [PLACEHOLDER] local dev server; swap for the deployed Worker URL before publishing
+const LEADERBOARD_API = "https://arcade-leaderboard.nathanslavik.workers.dev";
+const rand  = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const pick  = a => a[randi(0, a.length - 1)];
+
+/* ────────────────────────── audio ────────────────────────── */
+let ac = null;
+const audio = () => (ac ||= new (window.AudioContext || window.webkitAudioContext)());
+function tone(freq, dur, { type = "square", vol = .07, to = null, delay = 0 } = {}) {
+  if (!ac) return;
+  const t0 = ac.currentTime + delay;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t0);
+  if (to) o.frequency.exponentialRampToValueAtTime(Math.max(30, to), t0 + dur);
+  g.gain.setValueAtTime(0, t0);
+  g.gain.linearRampToValueAtTime(vol, t0 + .008);
+  g.gain.exponentialRampToValueAtTime(.0001, t0 + dur);
+  o.connect(g).connect(ac.destination);
+  o.start(t0); o.stop(t0 + dur + .02);
+}
+function noise(dur, vol = .12) {
+  if (!ac) return;
+  const n = Math.floor(ac.sampleRate * dur);
+  const buf = ac.createBuffer(1, n, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const s = ac.createBufferSource(), g = ac.createGain();
+  s.buffer = buf; g.gain.value = vol;
+  s.connect(g).connect(ac.destination); s.start();
+}
+const sfx = {
+  spit:   () => tone(160, .10, { to: 90, vol: .05, type: "sawtooth" }),
+  block:  n  => tone(420 + Math.min(n, 12) * 26, .09, { to: 900, vol: .07 }),
+  leak:   () => { tone(300, .45, { to: 60, vol: .10, type: "sawtooth" }); noise(.3, .07); },
+  power:  () => [0, 1, 2, 3, 4].forEach(i => tone([523, 659, 784, 1046, 1319][i], .16, { delay: i * .07, vol: .09, type: "triangle" })),
+  zap:    () => tone(1400, .05, { to: 2400, vol: .04, type: "sine" }),
+  over:   () => [0, 1, 2, 3].forEach(i => tone([392, 330, 262, 175][i], .3, { delay: i * .16, vol: .1, type: "sawtooth" })),
+  start:  () => [0, 1, 2].forEach(i => tone([392, 523, 784][i], .12, { delay: i * .09, vol: .08 })),
+  pass:   () => { tone(660, .10, { to: 990, vol: .06, type: "triangle" });
+                  tone(990, .12, { delay: .08, vol: .05, type: "triangle" }); },
+  oops:   () => { tone(180, .28, { to: 70, vol: .09 }); noise(.12, .05); },
+  level:  () => [0, 1].forEach(i => tone([660, 990][i], .12, { delay: i * .1, vol: .07, type: "triangle" })),
+};
+
+/* ─────────────── leaderboard ───────────────
+   Shared by every Arcade Arcade canvas game. Source of truth lives in
+   arcade-leaderboard/client/leaderboard.js; `bun client/sync.js` pastes it into each game.
+   The game supplies its own `text()` so the board matches its look.
+
+     const lb = createLeaderboard({ api, game, ctx, W, text, accent, sfx });
+     lb.start()          when a run begins (asks the server for a run id)
+     lb.finish(score)    when a run ends (loads the board, opens initials entry if it placed)
+     lb.busy             true while loading / entering initials / sending: don't restart yet
+     lb.key(e)           returns true if the leaderboard used the key
+     lb.tap(x, y)        canvas coords; returns true if the leaderboard used the tap
+     lb.draw(y0)         draws the panel from y0 downward (about 330px tall)            */
+function createLeaderboard({ api, game, ctx, W, text, accent = "#ffd23f", sfx = {} }) {
+  const ABC = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const TOP = 10;
+  let run = null, phase = null, top = [], score = 0, rank = 0, mineId = null, note = "";
+  let letters = [0, 0, 0], cur = 0, boxes = [], okBox = null, openedAt = 0;
+  // Button-mashers hit Space through game over; ignore input for a beat after entry opens
+  const settling = () => performance.now() - openedAt < 800;
+
+  const post = (path, body) => fetch(api + path, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }).then(r => r.json().then(j => ({ ok: r.ok, ...j })));
+
+  const qualifies = s => s > 0 && (top.length < TOP || s > top[top.length - 1].score);
+  const beep = f => { try { sfx.tone && sfx.tone(f); } catch (_) {} };
+
+  function start() {
+    run = null;
+    if (!api) return;
+    post("/runs", { game }).then(r => { if (r.run) run = r.run; }).catch(() => {});
+  }
+
+  function finish(s) {
+    score = s; rank = 0; mineId = null; note = ""; cur = 0;
+    if (!api) { phase = "offline"; return; }
+    phase = "loading";
+    fetch(api + "/scores?game=" + encodeURIComponent(game))
+      .then(r => r.json())
+      .then(j => {
+        top = j.top || [];
+        phase = run && qualifies(score) ? "entry" : "board";
+        openedAt = performance.now();
+        if (phase === "board" && score > 0 && !run && qualifies(score)) note = "SCORE NOT RECORDED";
+      })
+      .catch(() => { phase = "offline"; });
+  }
+
+  function submit() {
+    phase = "sending";
+    const initials = letters.map(i => ABC[i]).join("");
+    post("/scores", { run, initials, score })
+      .then(r => {
+        if (r.code === "blocked") { phase = "entry"; cur = 0; note = "PICK DIFFERENT INITIALS"; openedAt = performance.now(); return; }
+        if (!r.ok) { phase = "board"; note = "SCORE NOT RECORDED"; return; }
+        top = r.top; rank = r.rank; mineId = r.id; run = null; note = ""; phase = "board";
+        sfx.saved && sfx.saved();
+      })
+      .catch(() => { phase = "offline"; });
+  }
+
+  function nudge(d) { letters[cur] = (letters[cur] + d + 26) % 26; beep(520 + letters[cur] * 12); note = ""; }
+  function advance() { if (cur < 2) { cur++; beep(700); } else submit(); }
+
+  function key(e) {
+    if (phase === "loading" || phase === "sending") return true;
+    if (phase !== "entry") return false;
+    if (settling()) return true;
+    const k = e.key;
+    if (k === "ArrowUp") nudge(1);
+    else if (k === "ArrowDown") nudge(-1);
+    else if (k === "ArrowLeft") cur = Math.max(0, cur - 1);
+    else if (k === "ArrowRight") cur = Math.min(2, cur + 1);
+    else if (k === "Backspace") cur = Math.max(0, cur - 1);
+    else if (k === "Enter") advance();
+    else if (/^[a-z]$/i.test(k)) { letters[cur] = ABC.indexOf(k.toUpperCase()); note = ""; beep(640); if (cur < 2) cur++; }
+    else return true;
+    e.preventDefault && e.preventDefault();
+    return true;
+  }
+
+  function tap(x, y) {
+    if (phase === "loading" || phase === "sending") return true;
+    if (phase !== "entry") return false;
+    if (settling()) return true;
+    if (okBox && x > okBox.x && x < okBox.x + okBox.w && y > okBox.y && y < okBox.y + okBox.h) { submit(); return true; }
+    boxes.forEach((b, i) => {
+      if (x > b.x && x < b.x + b.w && y > b.y - 30 && y < b.y + b.h + 30) {
+        cur = i;
+        nudge(y < b.y + b.h / 2 ? 1 : -1);
+      }
+    });
+    return true;
+  }
+
+  function panel(y0, h) {
+    ctx.fillStyle = "rgba(8,6,26,.82)";
+    ctx.fillRect(40, y0, W - 80, h);
+    ctx.strokeStyle = accent; ctx.lineWidth = 2;
+    ctx.strokeRect(40.5, y0 + .5, W - 81, h - 1);
+  }
+
+  function draw(y0) {
+    const blink = Math.sin(performance.now() / 160) > -.2;
+    if (phase === "loading" || phase === "sending") {
+      text(phase === "loading" ? "LOADING HIGH SCORES..." : "SAVING...", W / 2, y0 + 40, { size: 14, color: accent, align: "center" });
+      return;
+    }
+    if (phase === "offline") {
+      text("LEADERBOARD OFFLINE", W / 2, y0 + 40, { size: 14, color: "rgba(200,205,255,.6)", align: "center" });
+      return;
+    }
+    if (phase === "entry") {
+      panel(y0, 250);
+      text("NEW TOP 10 SCORE!", W / 2, y0 + 40, { size: 22, color: accent, align: "center", glow: 14 });
+      text("ENTER YOUR INITIALS", W / 2, y0 + 68, { size: 12, color: "#cfd8ff", align: "center" });
+      boxes = [];
+      for (let i = 0; i < 3; i++) {
+        const bx = W / 2 - 96 + i * 66, by = y0 + 100, bw = 60, bh = 70;
+        boxes.push({ x: bx, y: by, w: bw, h: bh });
+        const on = i === cur;
+        ctx.fillStyle = on ? "rgba(255,255,255,.08)" : "rgba(0,0,0,.35)";
+        ctx.fillRect(bx, by, bw, bh);
+        if (on && blink) { ctx.fillStyle = accent; ctx.fillRect(bx + 8, by + bh - 8, bw - 16, 4); }
+        text(ABC[letters[i]], bx + bw / 2, by + 50, { size: 44, color: on ? "#fff" : "#9aa3cc", align: "center", glow: on ? 12 : 0 });
+        if (on) {
+          text("▲", bx + bw / 2, by - 8, { size: 14, color: accent, align: "center" });
+          text("▼", bx + bw / 2, by + bh + 20, { size: 14, color: accent, align: "center" });
+        }
+      }
+      okBox = { x: W / 2 - 50, y: y0 + 204, w: 100, h: 32 };
+      ctx.fillStyle = accent; ctx.fillRect(okBox.x, okBox.y, okBox.w, okBox.h);
+      text("OK", W / 2, okBox.y + 23, { size: 18, color: "#12072e", align: "center" });
+      text(note || "▲▼ LETTER   ◀▶ MOVE   ENTER OK", W / 2, y0 + 272,
+           { size: 10, color: note ? "#ff8fa3" : "rgba(200,205,255,.7)", align: "center" });
+      return;
+    }
+    if (phase === "board") {
+      const rows = Math.max(top.length, 1);
+      panel(y0, 58 + rows * 24);
+      text("TOP 10", W / 2, y0 + 34, { size: 22, color: accent, align: "center", glow: 12 });
+      if (!top.length) text("NO SCORES YET. BE THE FIRST.", W / 2, y0 + 68, { size: 12, color: "#cfd8ff", align: "center" });
+      top.forEach((r, i) => {
+        const y = y0 + 68 + i * 24, me = r.id === mineId;
+        if (me && !blink) return;
+        const c = me ? accent : i === 0 ? "#fff" : "#b9c2ee";
+        text(String(i + 1).padStart(2, " ") + ".", W / 2 - 110, y, { size: 15, color: c });
+        text(r.initials, W / 2 - 40, y, { size: 15, color: c, glow: me ? 8 : 0 });
+        text(String(r.score).padStart(7, " "), W / 2 + 110, y, { size: 15, color: c, align: "right" });
+      });
+      const foot = y0 + 82 + rows * 24;
+      if (note) text(note, W / 2, foot, { size: 11, color: "#ff8fa3", align: "center" });
+      else if (rank > TOP) text("YOU PLACED #" + rank, W / 2, foot, { size: 12, color: accent, align: "center" });
+      else if (!mineId && score > 0) text("YOUR SCORE " + score + " DIDN'T PLACE. TRY AGAIN.", W / 2, foot, { size: 11, color: "#cfd8ff", align: "center" });
+    }
+  }
+
+  return {
+    start, finish, key, tap, draw,
+    get busy() { return phase === "loading" || phase === "entry" || phase === "sending"; },
+    get phase() { return phase; },
+  };
+}
+/* ─────────────── /leaderboard ─────────────── */
+const lb = createLeaderboard({
+  api: LEADERBOARD_API, game: "guardrail-blocker", ctx, W, text, accent: "#ffd23f",
+  sfx: { tone: f => tone(f, .05, { vol: .05 }), saved: () => sfx.power() },
+});
+
+/* ────────────────────────── tuning ───────────────────────── */
+const CFG = {
+  paddle:  { w: 96, h: 16, y: H - 58, speed: 460, accel: 3400 },
+  fall:    { base: 62, perBlock: .022, max: 4.2 },   // speed multiplier growth
+  spawn:   { base: 1.55, perBlock: .028, min: .38 }, // seconds between creatures
+  logo:    { rate: .33, minGap: 13, duration: 5 },  // rate = avg chance/sec once minGap elapses
+  lives:   3,
+  shieldUp: 48,       // auto-governance shield height above the paddle
+  greenChance: .45,   // share of spawns that are good (green) agents
+  greenPenalty: 15,   // points lost for blocking a green agent
+};
+
+/* ────────────────────────── state ────────────────────────── */
+let state, paddle, creatures, logos, parts, floats, keys, pointerX;
+let score, hiScore, lives, blocked, passed, handled, level, spawnTimer, logoTimer;
+let auto, flash, shake, comboTimer, combo, t, spitFx, bannerTimer;
+
+hiScore = +(localStorage.getItem(HI_KEY) || 0);
+keys = Object.create(null);
+
+function reset() {
+  paddle = { x: W / 2, vx: 0, w: CFG.paddle.w, flash: 0 };
+  creatures = []; logos = []; parts = []; floats = [];
+  score = 0; lives = CFG.lives; blocked = 0; passed = 0; handled = 0; level = 1;
+  spawnTimer = 1.1; logoTimer = 7;
+  auto = 0; flash = 0; shake = 0; combo = 0; comboTimer = 0;
+  t = 0; spitFx = 0; bannerTimer = 0; pointerX = null;
+}
+reset();
+state = "title";
+
+const speedMult  = () => Math.min(CFG.fall.max, 1 + handled * CFG.fall.perBlock);
+const spawnEvery = () => Math.max(CFG.spawn.min, CFG.spawn.base - handled * CFG.spawn.perBlock);
+const shieldY    = () => CFG.paddle.y - CFG.shieldUp;
+
+/* ────────────────────────── quit dialog ──────────────────── */
+/* A quick tap or click on the field (no drag) asks to quit. Drags still steer. */
+const TAP = { ms: 250, px: 10 };
+const QUIT_Y = { x: W / 2 - 96, y: H / 2 + 6, w: 84, h: 46 };
+const QUIT_N = { x: W / 2 + 12, y: H / 2 + 6, w: 84, h: 46 };
+const inBox = (p, b) => p.x > b.x && p.x < b.x + b.w && p.y > b.y && p.y < b.y + b.h;
+let tapStart = null;
+function askQuit() { state = "quit"; keys = Object.create(null); tone(330, .08, { vol: .05 }); }
+function resumeFromQuit() { state = "playing"; last = performance.now(); }
+function quitKey(e) {
+  const k = e.key.toLowerCase();
+  if (k === "y") { quitToArcade(); return true; }
+  if (k === "n" || k === "escape") { resumeFromQuit(); return true; }
+  return true;   // swallow everything else while the dialog is up
+}
+function quitTap(p) {
+  if (inBox(p, QUIT_Y)) quitToArcade();
+  else if (inBox(p, QUIT_N)) resumeFromQuit();
+}
+function drawQuit() {
+  overlay(.7);
+  text("QUIT?", W / 2, H / 2 - 40, { size: 44, color: "#fff", align: "center", glow: 16 });
+  for (const [b, label, c] of [[QUIT_Y, "Y", "#ff4d5e"], [QUIT_N, "N", "#6ef2a0"]]) {
+    ctx.fillStyle = "rgba(0,0,0,.45)"; ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.strokeRect(b.x + .5, b.y + .5, b.w - 1, b.h - 1);
+    text(label, b.x + b.w / 2, b.y + 33, { size: 26, color: c, align: "center", glow: 10 });
+  }
+  text("Y  BACK TO THE ARCADE      N  KEEP PLAYING", W / 2, H / 2 + 84, { size: 11, color: "rgba(200,205,255,.75)", align: "center" });
+}
+// Quit sends players back to The Arcade Arcade. Relative, so it works on GitHub Pages
+// (/<game>/ -> /arcade-arcade/) and on the local dev server. #games skips the coin.
+const ARCADE_URL = "../arcade-arcade/#games";
+function quitToArcade() { location.href = ARCADE_URL; }
+
+/* Under the high score board: Space retries, X (or tapping the exit line) goes back to the arcade */
+const EXIT_LINE = { x: 0, y: 682, w: W, h: 38 };
+function drawRetryExit() {
+  if (lb.busy) return;
+  if (Math.sin(t * 4) > -.3)
+    text("PRESS SPACE TO RETRY", W / 2, 664, { size: 17, color: "#fff", align: "center", glow: 12 });
+  text("PRESS X TO EXIT", W / 2, 698, { size: 14, color: "#ff8fa3", align: "center" });
+}
+
+/* ────────────────────────── input ────────────────────────── */
+function startGame() { reset(); state = "playing"; sfx.start(); lb.start(); }
+
+addEventListener("keydown", e => {
+  audio();
+  if (state === "gameover" && lb.key(e)) return;
+  if (state === "gameover" && e.key.toLowerCase() === "x") { quitToArcade(); return; }
+  if (state === "quit") { quitKey(e); e.preventDefault(); return; }
+  if (e.key === "Escape" && state === "playing") { askQuit(); return; }
+  if (["ArrowLeft", "ArrowRight", " ", "ArrowUp", "ArrowDown"].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === " " || e.key === "Enter") {
+    if (state === "title" || state === "gameover") startGame();
+    else if (state === "paused") state = "playing";
+  }
+  if (e.key.toLowerCase() === "p" && (state === "playing" || state === "paused"))
+    state = state === "playing" ? "paused" : "playing";
+});
+addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+
+function toCanvasX(clientX) {
+  const r = cv.getBoundingClientRect();
+  return clamp((clientX - r.left) / r.width * W, 0, W);
+}
+cv.addEventListener("pointermove", e => { pointerX = toCanvasX(e.clientX); });
+cv.addEventListener("pointerleave", () => { pointerX = null; tapStart = null; });
+cv.addEventListener("pointerup", e => {
+  const s = tapStart; tapStart = null;
+  if (!s || state !== "playing") return;
+  if (performance.now() - s.t < TAP.ms && Math.hypot(e.clientX - s.x, e.clientY - s.y) < TAP.px) askQuit();
+});
+function toCanvas(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+cv.addEventListener("pointerdown", e => {
+  audio();
+  if (state === "quit") { quitTap(toCanvas(e)); return; }
+  pointerX = toCanvasX(e.clientX);
+  tapStart = state === "playing" ? { x: e.clientX, y: e.clientY, t: performance.now() } : null;
+  if (state === "gameover") {
+    const r = cv.getBoundingClientRect();
+    const y = (e.clientY - r.top) / r.height * H;
+    if (lb.tap(pointerX, y)) return;
+    if (inBox({ x: pointerX, y }, EXIT_LINE)) { quitToArcade(); return; }
+  }
+  if (state === "title" || state === "gameover") startGame();
+  else if (state === "paused") state = "playing";
+});
+
+/* ────────────────────────── spawning ─────────────────────── */
+/* green = good agent (let it through), red = bad agent (block it).
+   Colour is backed up by silhouette: greens wear an antenna, reds wear horns. */
+const SPECIES = [
+  { team: "green", name: "helper", body: "#6ef2a0", dark: "#2aa163", eye: "#08160f", r: 15, drift: 26, legs: 2 },
+  { team: "green", name: "runner", body: "#35d97e", dark: "#17784a", eye: "#08160f", r: 12, drift: 46, legs: 3 },
+  { team: "red",   name: "rogue",  body: "#ff4d5e", dark: "#a3162b", eye: "#2a0308", r: 14, drift: 54, legs: 3 },
+  { team: "red",   name: "leech",  body: "#e0245e", dark: "#870d33", eye: "#2a0308", r: 17, drift: 22, legs: 4 },
+];
+const GREENS = SPECIES.filter(s => s.team === "green");
+const REDS   = SPECIES.filter(s => s.team === "red");
+
+function spawnCreature() {
+  const s = pick(Math.random() < CFG.greenChance ? GREENS : REDS);
+  const x = rand(34, W - 34);
+  creatures.push({
+    x, y: 108, sp: s, r: s.r,
+    vy: CFG.fall.base * speedMult() * rand(.88, 1.14),
+    vx: rand(-1, 1) * s.drift * (.5 + speedMult() * .28),
+    ph: rand(0, 6.28), squash: 1, blink: rand(1, 4),
+  });
+  spitFx = .18;
+  sfx.spit();
+  for (let i = 0; i < 8; i++) burst(x, 100, s.body, 1.6);
+}
+
+function spawnLogo() {
+  logos.push({ x: rand(56, W - 56), y: 104, vy: 92, rot: 0, spin: rand(-1.4, 1.4), t: 0 });
+  spitFx = .25;
+  tone(760, .3, { to: 1200, vol: .07, type: "triangle" });
+}
+
+function levelCheck() {
+  const nl = 1 + Math.floor(handled / 12);
+  if (nl > level) { level = nl; bannerTimer = 1.4; sfx.level(); }
+}
+
+/* ────────────────────────── fx helpers ───────────────────── */
+function burst(x, y, color, spread = 3, n = 1) {
+  for (let i = 0; i < n; i++)
+    parts.push({
+      x, y, color,
+      vx: rand(-70, 70) * spread * .35, vy: rand(-140, 40) * spread * .3,
+      life: rand(.28, .62), max: .62, size: randi(2, 4),
+    });
+}
+function pop(x, y, color) {
+  for (let i = 0; i < 16; i++) burst(x, y, i % 4 === 0 ? "#ffffff" : color, 3);
+}
+function float(x, y, text, color = "#fff") {
+  floats.push({ x, y, text, color, life: .9 });
+}
+
+/* ────────────────────────── update ───────────────────────── */
+function update(dt) {
+  t += dt;
+  spitFx = Math.max(0, spitFx - dt);
+  flash  = Math.max(0, flash - dt * 2.2);
+  shake  = Math.max(0, shake - dt * 26);
+  paddle.flash = Math.max(0, paddle.flash - dt * 5);
+  bannerTimer = Math.max(0, bannerTimer - dt);
+  if (comboTimer > 0 && (comboTimer -= dt) <= 0) combo = 0;
+
+  if (state !== "playing") return;
+
+  /* paddle: keyboard has priority, pointer as fallback */
+  const left = keys.arrowleft || keys.a, right = keys.arrowright || keys.d;
+  if (left || right) {
+    pointerX = null;
+    paddle.vx += (right ? 1 : -1) * CFG.paddle.accel * dt;
+  } else if (pointerX !== null) {
+    paddle.vx = clamp((pointerX - paddle.x) * 12, -CFG.paddle.speed * 1.6, CFG.paddle.speed * 1.6);
+  } else {
+    paddle.vx *= Math.pow(.0015, dt);
+  }
+  paddle.vx = clamp(paddle.vx, -CFG.paddle.speed, CFG.paddle.speed);
+  paddle.x  = clamp(paddle.x + paddle.vx * dt, paddle.w / 2, W - paddle.w / 2);
+  if (paddle.x <= paddle.w / 2 || paddle.x >= W - paddle.w / 2) paddle.vx = 0;
+
+  /* auto-block window */
+  if (auto > 0) {
+    auto -= dt;
+    if (auto <= 0) { auto = 0; float(W / 2 - 46, shieldY() - 24, "SHIELD OFF", "#ff5fa2"); tone(300, .25, { to: 120, vol: .06 }); }
+  }
+
+  /* spawns */
+  if ((spawnTimer -= dt) <= 0) {
+    spawnTimer = spawnEvery() * rand(.82, 1.18);
+    spawnCreature();
+  }
+  logoTimer += dt;
+  if (logoTimer > CFG.logo.minGap && logos.length === 0 && Math.random() < CFG.logo.rate * dt) {
+    logoTimer = 0;
+    spawnLogo();
+  }
+
+  const px0 = paddle.x - paddle.w / 2, px1 = paddle.x + paddle.w / 2;
+  const py0 = CFG.paddle.y, py1 = CFG.paddle.y + CFG.paddle.h;
+
+  /* creatures */
+  for (let i = creatures.length - 1; i >= 0; i--) {
+    const c = creatures[i];
+    c.y  += c.vy * dt;
+    c.x  += c.vx * dt;
+    c.ph += dt * 7;
+    c.squash += (1 - c.squash) * dt * 8;
+    c.blink -= dt;
+    if (c.blink < -.12) c.blink = rand(1.5, 5);
+    if (c.x < c.r + 4)      { c.x = c.r + 4;      c.vx = Math.abs(c.vx); }
+    if (c.x > W - c.r - 4)  { c.x = W - c.r - 4;  c.vx = -Math.abs(c.vx); }
+
+    const red = c.sp.team === "red";
+
+    /* auto-governance shield — stops reds, lets greens fall through */
+    if (auto > 0 && red && c.y + c.r >= shieldY()) {
+      creatures.splice(i, 1);
+      pop(c.x, shieldY(), "#4fd1ff");
+      score += 15; blocked++; handled++;
+      float(c.x - 10, shieldY() - 12, "+15", "#4fd1ff");
+      sfx.zap();
+      levelCheck();
+      continue;
+    }
+
+    /* paddle contact — greens phase through the blocker while the shield is up */
+    const near = c.x > px0 - c.r && c.x < px1 + c.r;
+    const hits = near && c.y + c.r >= py0 && c.y - c.r < py1 && !(auto > 0 && !red);
+    if (hits) {
+      creatures.splice(i, 1);
+      if (red) {                                   /* good block */
+        blocked++; handled++;
+        combo++; comboTimer = 1.6;
+        const gain = 10 + Math.min(combo - 1, 9) * 5;
+        score += gain;
+        pop(c.x, py0 - 4, c.sp.body);
+        float(c.x - 12, py0 - 22, "+" + gain, combo > 2 ? "#ffd23f" : "#fff");
+        if (combo > 2) float(c.x - 16, py0 - 40, "x" + combo, "#ff5fa2");
+        paddle.flash = 1; shake = Math.min(shake + 3, 8);
+        sfx.block(combo);
+        levelCheck();
+      } else {                                     /* blocked a good agent */
+        score = Math.max(0, score - CFG.greenPenalty);
+        combo = 0; shake = 6;
+        pop(c.x, py0 - 4, "#8f9ab8");
+        float(clamp(c.x - 30, 6, W - 132), py0 - 24, "-" + CFG.greenPenalty + " GOOD AGENT", "#ffb3c0");
+        sfx.oops();
+      }
+      continue;
+    }
+
+    /* reached the bottom: greens score, reds cost a life */
+    if (c.y - c.r > H) {
+      creatures.splice(i, 1);
+      if (!red) {
+        passed++; handled++;
+        combo++; comboTimer = 1.6;
+        const gain = 15 + Math.min(combo - 1, 9) * 5;
+        score += gain;
+        for (let k = 0; k < 12; k++) burst(c.x, H - 8, "#6ef2a0", 2);
+        float(clamp(c.x - 12, 6, W - 48), H - 30, "+" + gain, "#6ef2a0");
+        if (combo > 2) float(clamp(c.x - 16, 6, W - 60), H - 48, "x" + combo, "#ffd23f");
+        sfx.pass();
+        levelCheck();
+      } else {
+        lives--; combo = 0; flash = .55; shake = 16;
+        sfx.leak();
+        for (let k = 0; k < 14; k++) burst(c.x, H - 6, "#ff3355", 3);
+        if (lives <= 0) {
+          state = "gameover";
+          if (score > hiScore) { hiScore = score; localStorage.setItem(HI_KEY, hiScore); }
+          sfx.over();
+          lb.finish(score);
+        }
+      }
+    }
+  }
+
+  /* arcade logo pickup */
+  for (let i = logos.length - 1; i >= 0; i--) {
+    const g = logos[i];
+    g.t += dt;
+    g.y += g.vy * dt;
+    g.rot += g.spin * dt;
+    const near = g.x > px0 - 20 && g.x < px1 + 20;
+    if (near && g.y + 18 >= py0 && g.y - 18 < py1) {
+      logos.splice(i, 1);
+      const extended = auto > 0;
+      auto = (extended ? auto : 0) + CFG.logo.duration;
+      score += 100; flash = 1; shake = 10;
+      paddle.flash = 1.6;
+      float(paddle.x - 24, py0 - 30, "+100", "#ff8a3d");
+      float(W / 2 - 82, shieldY() - 30, extended ? "SHIELD EXTENDED!" : "AUTO-GOVERNANCE ON!", "#ffd23f");
+      for (let k = 0; k < 46; k++) burst(g.x, py0 - 6, pick(["#ff8a3d", "#ffd23f", "#ffffff", "#4fd1ff"]), 4);
+      sfx.power();
+      continue;
+    }
+    if (g.y - 20 > H) logos.splice(i, 1);
+  }
+
+  /* particles + score pops */
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.vy += 420 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if ((p.life -= dt) <= 0) parts.splice(i, 1);
+  }
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.y -= 34 * dt;
+    if ((f.life -= dt) <= 0) floats.splice(i, 1);
+  }
+}
+
+/* ────────────────────────── drawing ──────────────────────── */
+function text(str, x, y, { size = 16, color = "#cfd8ff", align = "left", weight = "bold", glow = 0 } = {}) {
+  ctx.font = `${weight} ${size}px "Courier New",monospace`;
+  ctx.textAlign = align;
+  ctx.textBaseline = "alphabetic";
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+  ctx.shadowBlur = 0;
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#120c2c"); g.addColorStop(.55, "#0a0820"); g.addColorStop(1, "#05040f");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  /* drifting grid floor */
+  ctx.strokeStyle = "rgba(96,72,180,.20)"; ctx.lineWidth = 1;
+  const off = (t * 26) % 40;
+  for (let y = 140 + off; y < H; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  for (let x = 0; x <= W; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, 140); ctx.lineTo(x, H); ctx.stroke();
+  }
+  /* stars */
+  ctx.fillStyle = "rgba(255,255,255,.5)";
+  for (let i = 0; i < 26; i++) {
+    const sx = (i * 137.5) % W, sy = (i * 61.8 + t * (6 + i % 5) * 2) % H;
+    ctx.globalAlpha = .18 + .32 * Math.abs(Math.sin(t * 1.4 + i));
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* the creature dispenser */
+function drawComputer() {
+  const kick = spitFx * 14;
+  const x = W / 2, y = 52 - kick * .4;
+
+  /* legs / stand */
+  ctx.fillStyle = "#2b2745";
+  ctx.fillRect(x - 96, y + 34, 192, 8);
+
+  /* chassis */
+  ctx.fillStyle = "#9aa0c9"; ctx.fillRect(x - 92, y - 36, 184, 72);
+  ctx.fillStyle = "#c6cbe8"; ctx.fillRect(x - 92, y - 36, 184, 6);
+  ctx.fillStyle = "#5d6493"; ctx.fillRect(x - 92, y + 30, 184, 6);
+
+  /* screen */
+  ctx.fillStyle = "#07142c"; ctx.fillRect(x - 74, y - 26, 112, 52);
+  ctx.fillStyle = "rgba(110,242,160,.85)";
+  for (let r = 0; r < 5; r++) {
+    const wob = Math.sin(t * 3 + r) * 6;
+    ctx.fillRect(x - 68, y - 20 + r * 10, 42 + wob + (r % 2) * 22, 4);
+  }
+  ctx.fillStyle = "rgba(110,242,160,.10)";
+  ctx.fillRect(x - 74, y - 26 + ((t * 40) % 52), 112, 6);
+
+  /* status lights + vents */
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = spitFx > 0 && i === 0 ? "#ff5fa2"
+      : ["#ffd23f", "#6ef2a0", "#4fd1ff"][i];
+    ctx.globalAlpha = .45 + .55 * Math.abs(Math.sin(t * 4 + i * 2));
+    ctx.fillRect(x + 52, y - 22 + i * 14, 10, 8);
+  }
+  ctx.globalAlpha = 1;
+
+  /* dispenser chute */
+  ctx.fillStyle = "#4a4570"; ctx.fillRect(x - 30, y + 42, 60, 14);
+  ctx.fillStyle = "#0c0a18"; ctx.fillRect(x - 24, y + 46, 48, 10);
+  if (spitFx > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${spitFx * 3})`;
+    ctx.fillRect(x - 26, y + 48, 52, 8);
+  }
+  text("MODEL.EXE", x - 88, y + 52, { size: 9, color: "rgba(200,255,220,.5)" });
+}
+
+function drawCreature(c) {
+  const sq = c.squash, bob = Math.sin(c.ph) * 2;
+  const r = c.r;
+  ctx.save();
+  ctx.translate(c.x, c.y + bob);
+
+  /* legs */
+  ctx.fillStyle = c.sp.dark;
+  for (let i = 0; i < c.sp.legs; i++) {
+    const lx = -r + 4 + i * (2 * (r - 4) / Math.max(1, c.sp.legs - 1 || 1));
+    const wig = Math.sin(c.ph * 1.6 + i) * 3;
+    ctx.fillRect(lx - 2, r - 4, 4, 8 + wig);
+  }
+  /* body */
+  ctx.fillStyle = c.sp.body;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, r / sq, r * sq, 0, 0, Math.PI * 2);
+  ctx.fill();
+  /* shade + highlight */
+  ctx.fillStyle = c.sp.dark;
+  ctx.beginPath(); ctx.ellipse(0, r * .42, r * .62, r * .3, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.35)";
+  ctx.fillRect(-r * .5, -r * .62, 5, 4);
+  /* team tell: antenna (green, friendly) vs horns (red, hostile) */
+  if (c.sp.team === "green") {
+    ctx.strokeStyle = c.sp.dark; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, -r * .85); ctx.lineTo(0, -r * 1.5); ctx.stroke();
+    ctx.fillStyle = "#eafff2";
+    ctx.beginPath(); ctx.arc(0, -r * 1.62, r * .2, 0, 6.283); ctx.fill();
+  } else {
+    ctx.fillStyle = c.sp.dark;
+    for (const sx of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(sx * r * .78, -r * .48);
+      ctx.lineTo(sx * r * .42, -r * 1.34);
+      ctx.lineTo(sx * r * .18, -r * .60);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  /* eyes */
+  const open = c.blink > 0;
+  ctx.fillStyle = "#fff";
+  const ex = r * .34, ey = -r * .12, ew = r * .3, eh = open ? r * .34 : 2;
+  ctx.fillRect(-ex - ew / 2, ey - eh / 2, ew, eh);
+  ctx.fillRect(ex - ew / 2, ey - eh / 2, ew, eh);
+  if (open) {
+    ctx.fillStyle = c.sp.eye;
+    const look = clamp(c.vx / 60, -1, 1) * 2;
+    ctx.fillRect(-ex - 2 + look, ey - 2, 4, 4);
+    ctx.fillRect(ex - 2 + look, ey - 2, 4, 4);
+  }
+  /* brows + mouth */
+  if (c.sp.team === "red") {
+    ctx.fillStyle = c.sp.dark;
+    for (const sx of [-1, 1]) {
+      ctx.save();
+      ctx.translate(sx * ex, ey - r * .40);
+      ctx.rotate(sx * -.36);
+      ctx.fillRect(-r * .26, -1.5, r * .52, 3);
+      ctx.restore();
+    }
+    ctx.strokeStyle = c.sp.eye; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, r * .54, r * .3, Math.PI + .35, -.35); ctx.stroke();
+  } else {
+    ctx.strokeStyle = c.sp.eye; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, r * .18, r * .32, .3, Math.PI - .3); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawLogo(g) {
+  const s = 1 + Math.sin(g.t * 6) * .06;
+  ctx.save();
+  ctx.translate(g.x, g.y);
+  ctx.rotate(Math.sin(g.rot) * .18);
+  ctx.scale(s, s);
+
+  /* glow halo */
+  const halo = ctx.createRadialGradient(0, 0, 4, 0, 0, 42);
+  halo.addColorStop(0, "rgba(255,180,90,.55)");
+  halo.addColorStop(1, "rgba(255,140,60,0)");
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(0, 0, 42, 0, 6.283); ctx.fill();
+
+  /* badge */
+  const grad = ctx.createLinearGradient(-20, -20, 20, 20);
+  grad.addColorStop(0, "#ffb347"); grad.addColorStop(1, "#ff6a2f");
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  if (ctx.roundRect) { ctx.roundRect(-21, -21, 42, 42, 10); } else { ctx.rect(-21, -21, 42, 42); }
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 2; ctx.stroke();
+
+  /* chunky "A" mark */
+  ctx.fillStyle = "#1a0f04";
+  ctx.beginPath();
+  ctx.moveTo(0, -13); ctx.lineTo(12, 14); ctx.lineTo(5, 14);
+  ctx.lineTo(0, 1);   ctx.lineTo(-5, 14); ctx.lineTo(-12, 14);
+  ctx.closePath(); ctx.fill();
+  ctx.fillRect(-7, 5, 14, 3);
+
+  ctx.restore();
+  text("ARCADE GOVERNANCE", clamp(g.x, 56, W - 56), g.y + 38,
+       { size: 10, color: "#ffd0a0", align: "center", glow: 8 });
+}
+
+function drawShield() {
+  if (auto <= 0) return;
+  const y = shieldY();
+  const a = auto < 2 ? .35 + .45 * Math.abs(Math.sin(t * 16)) : .85;
+  ctx.save();
+  ctx.globalAlpha = a;
+  const g = ctx.createLinearGradient(0, y - 10, 0, y + 10);
+  g.addColorStop(0, "rgba(79,209,255,0)");
+  g.addColorStop(.5, "rgba(79,209,255,.75)");
+  g.addColorStop(1, "rgba(79,209,255,0)");
+  ctx.fillStyle = g; ctx.fillRect(0, y - 10, W, 20);
+  ctx.fillStyle = "#dffaff";
+  for (let x = (t * 90) % 24 - 24; x < W; x += 24) ctx.fillRect(x, y - 1, 12, 2);
+  ctx.restore();
+
+  /* timer bar */
+  const pct = clamp(auto / CFG.logo.duration, 0, 1);
+  ctx.fillStyle = "rgba(0,0,0,.45)"; ctx.fillRect(W / 2 - 80, y - 30, 160, 8);
+  ctx.fillStyle = auto < 1.5 ? "#ff5fa2" : "#4fd1ff";
+  ctx.fillRect(W / 2 - 79, y - 29, 158 * pct, 6);
+  text("AUTO-GOVERNANCE " + auto.toFixed(1) + "s", W / 2, y - 36, { size: 10, color: "#9fe8ff", align: "center" });
+}
+
+function drawPaddle() {
+  const x = paddle.x - paddle.w / 2, y = CFG.paddle.y, w = paddle.w, h = CFG.paddle.h;
+  ctx.save();
+  if (paddle.flash > 0) { ctx.shadowColor = "#fff"; ctx.shadowBlur = 24 * paddle.flash; }
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, "#eafcff"); g.addColorStop(.35, "#4fd1ff"); g.addColorStop(1, "#1560a8");
+  ctx.fillStyle = g; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = "rgba(255,255,255,.9)"; ctx.fillRect(x, y, w, 3);
+  ctx.fillStyle = "rgba(8,32,58,.5)"; ctx.fillRect(x + 4, y + 5, w - 8, 8);
+  text("GUARDRAILS", x + w / 2, y + 12,
+       { size: 9, color: "#eafcff", align: "center" });
+  /* end caps */
+  ctx.fillStyle = "#ff8a3d";
+  ctx.fillRect(x - 4, y + 2, 4, h - 4);
+  ctx.fillRect(x + w, y + 2, 4, h - 4);
+  ctx.restore();
+  /* the floor is your stack: greens should land here, reds must not */
+  ctx.fillStyle = "rgba(140,152,255,.35)";
+  ctx.fillRect(0, H - 4, W, 4);
+  text("YOUR BUSINESS SYSTEMS", W / 2, H - 8,
+       { size: 9, color: "rgba(180,190,255,.38)", align: "center" });
+}
+
+function drawHud() {
+  ctx.fillStyle = "rgba(6,4,20,.72)"; ctx.fillRect(0, 0, W, 22);
+  text("SCORE " + String(score).padStart(6, "0"), 8, 15, { size: 13, color: "#6ef2a0" });
+  text("HI " + String(hiScore).padStart(6, "0"), W / 2, 15, { size: 13, color: "#ffd23f", align: "center" });
+  text("LV " + level, W - 8, 15, { size: 13, color: "#4fd1ff", align: "right" });
+
+  /* lives */
+  for (let i = 0; i < lives; i++) {
+    const lx = 12 + i * 18, ly = 34;
+    ctx.fillStyle = "#ff5fa2";
+    ctx.beginPath(); ctx.arc(lx, ly, 6, 0, 6.283); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.fillRect(lx - 3, ly - 2, 2, 3); ctx.fillRect(lx + 1, ly - 2, 2, 3);
+  }
+  text("SPEED x" + speedMult().toFixed(2), W - 8, 38, { size: 10, color: "rgba(180,190,255,.6)", align: "right" });
+
+  if (combo > 2 && comboTimer > 0)
+    text("COMBO x" + combo, W / 2, 54, { size: 18, color: "#ffd23f", align: "center", glow: 12 });
+
+  if (bannerTimer > 0) {
+    ctx.globalAlpha = Math.min(1, bannerTimer * 1.6);
+    text("LEVEL " + level, W / 2, H / 2 - 40, { size: 40, color: "#ff8a3d", align: "center", glow: 20 });
+    ctx.globalAlpha = 1;
+  }
+}
+
+function overlay(alpha = .74) {
+  ctx.fillStyle = `rgba(4,3,14,${alpha})`;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawTitle() {
+  overlay(.66);
+  const bob = Math.sin(t * 2) * 4;
+  text("GUARDRAIL", W / 2, 190 + bob, { size: 56, color: "#ff8a3d", align: "center", glow: 26 });
+  text("BLOCKER", W / 2, 244 + bob, { size: 56, color: "#4fd1ff", align: "center", glow: 26 });
+
+  text("Don't let the model spit out a bad agent", W / 2, 300, { size: 13, color: "#cfd8ff", align: "center" });
+  text("that reaches your business systems.", W / 2, 320, { size: 13, color: "#cfd8ff", align: "center" });
+
+  /* the two teams, drawn live so you learn the silhouettes */
+  const sample = (x, y, sp, ph) =>
+    drawCreature({ x, y, r: 13, sp, ph, squash: 1, blink: 1, vx: 0 });
+
+  sample(92, 386, GREENS[0], t * 3);
+  text("GREEN AGENTS - LET THEM THROUGH", 118, 372, { size: 12, color: "#6ef2a0" });
+  text("+15 when one reaches your systems", 118, 388, { size: 10, color: "rgba(110,242,160,.65)" });
+  text("-" + CFG.greenPenalty + " when you wrongly block", 118, 404, { size: 10, color: "rgba(255,160,180,.75)" });
+
+  sample(92, 446, REDS[0], t * 3 + 1.7);
+  text("RED AGENTS - BLOCK THEM", 118, 440, { size: 12, color: "#ff4d5e" });
+  text("+10 blocked / -1 life if one gets through", 118, 456, { size: 10, color: "rgba(255,130,150,.7)" });
+
+  text("ARROW KEYS  or  A / D  - MOVE BLOCKER", W / 2, 520, { size: 13, color: "#cfd8ff", align: "center" });
+  text("MOUSE / TOUCH ALSO WORKS   P PAUSE   TAP QUIT", W / 2, 540, { size: 11, color: "rgba(180,190,255,.7)", align: "center" });
+
+  text("CATCH THE ARCADE LOGO - " + CFG.logo.duration + "s AUTO-GOVERNANCE", W / 2, 578,
+       { size: 11, color: "#ffd23f", align: "center", glow: 8 });
+  text("REDS BLOCKED, GREENS ROUTED STRAIGHT THROUGH", W / 2, 594,
+       { size: 10, color: "rgba(255,210,63,.7)", align: "center" });
+
+  if (Math.sin(t * 4) > -.3)
+    text("PRESS SPACE TO START", W / 2, 638, { size: 22, color: "#fff", align: "center", glow: 14 });
+  text("HI-SCORE " + String(hiScore).padStart(6, "0"), W / 2, 698, { size: 13, color: "#ffd23f", align: "center" });
+}
+
+function drawGameOver() {
+  overlay(.8);
+  text("GAME OVER", W / 2, 120, { size: 48, color: "#ff3355", align: "center", glow: 24 });
+  text("SCORE " + score, W / 2, 172, { size: 24, color: "#fff", align: "center" });
+  text("BAD AGENTS BLOCKED  " + blocked, W / 2, 204, { size: 13, color: "#ff4d5e", align: "center" });
+  text("GOOD AGENTS PASSED  " + passed, W / 2, 224, { size: 13, color: "#6ef2a0", align: "center" });
+  text("LEVEL REACHED  " + level, W / 2, 244, { size: 13, color: "#4fd1ff", align: "center" });
+  lb.draw(282);
+  drawRetryExit();
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.save();
+  if (shake > .2) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+
+  drawBackground();
+  drawComputer();
+  drawShield();
+  for (const g of logos) drawLogo(g);
+  for (const c of creatures) drawCreature(c);
+  drawPaddle();
+
+  for (const p of parts) {
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  for (const f of floats) {
+    ctx.globalAlpha = clamp(f.life / .9, 0, 1);
+    text(f.text, f.x, f.y, { size: 14, color: f.color, glow: 6 });
+  }
+  ctx.globalAlpha = 1;
+
+  drawHud();
+  ctx.restore();
+
+  if (flash > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${Math.min(.85, flash)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (state === "title") drawTitle();
+  if (state === "gameover") drawGameOver();
+  if (state === "quit") drawQuit();
+  if (state === "paused") {
+    overlay(.6);
+    text("PAUSED", W / 2, H / 2, { size: 40, color: "#fff", align: "center", glow: 16 });
+    text("PRESS P OR SPACE", W / 2, H / 2 + 36, { size: 14, color: "#cfd8ff", align: "center" });
+  }
+}
+
+/* ────────────────────────── loop ─────────────────────────── */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
