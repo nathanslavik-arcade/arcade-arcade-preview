@@ -276,6 +276,9 @@ const CFG = {
   camLead: 300,        // world units of screen kept below the agent
   hitR:   9,           // forgiving collision radius
   boss:   { maxAttempts: 5, closeDist: 124, sealTime: .24 },
+  // [TUNE] Time bonus per cleared level: [under this many seconds, bonus points], fastest first.
+  // Set to [] to switch the timer and bonus off entirely.
+  timeBonus: [[10, 1000], [20, 500], [30, 250]],
 };
 const FLOOR = H - 64;  // screen y where the camera's world origin sits
 
@@ -380,6 +383,7 @@ const TAUNTS = [
 /* ────────────────────────── state ────────────────────────── */
 let state, agent, rows, walls, parts, floats, keys, pointer;
 let score, hiScore, lives, level, L, passedCount, destWy, camY, t;
+let levelTime = 0, lastBonus = 0;   // seconds of play on this level, bonus it earned
 let flash, shake, dashT, coolT, banner, briefT, glitch;
 let attempts, denyIdx, denyT, sealT, cleared, totalPassed, tauntI, denyBy, hover, govLabelY = 240;
 
@@ -410,6 +414,7 @@ function makeRow(type, name, wy, cfg) {
 
 function loadLevel(i) {
   level = i;
+  levelTime = 0; lastBonus = 0;
   L = LEVELS[i];
   rows = L.rows.map(([type, name], k) => makeRow(type, name, 170 + k * ROW_GAP, L));
   destWy = rows[rows.length - 1].wy + 150;
@@ -706,6 +711,9 @@ function completeLevel() {
   state = "cleared";
   cleared++;
   score += 500;
+  const tier = CFG.timeBonus.find(([secs]) => levelTime < secs);
+  lastBonus = tier ? tier[1] : 0;
+  score += lastBonus;
   sfx.clear();
   flash = .7;
   for (let i = 0; i < 50; i++) burst(agent.x, scr(agent.wy), pick(["#6ef2a0", "#ffd23f", "#fff", "#ff8a3d"]), 4);
@@ -734,6 +742,7 @@ function update(dt) {
   }
 
   if (state !== "playing") return;
+  if (!walls) levelTime += dt;   // only real play time counts: briefs, pauses and Quit? don't
 
   if (L && L.halluc) glitch = Math.max(0, glitch - dt) || (Math.random() < dt * .8 ? .28 : 0);
 
@@ -1130,6 +1139,12 @@ function drawHud() {
   ctx.fillStyle = "rgba(6,4,20,.78)"; ctx.fillRect(0, 0, W, 40);
   text("SCORE " + String(score).padStart(6, "0"), 8, 15, { size: 13, color: "#6ef2a0" });
   text("HI " + String(hiScore).padStart(6, "0"), W - 8, 15, { size: 13, color: "#ffd23f", align: "right" });
+  if (!walls && CFG.timeBonus.length) {
+    /* the colour tells you which bonus you're still on track for */
+    const tier = CFG.timeBonus.findIndex(([secs]) => levelTime < secs);
+    const color = ["#6ef2a0", "#ffd23f", "#ff8a3d"][tier] || "rgba(180,190,255,.5)";
+    text("TIME " + levelTime.toFixed(1), W / 2, 15, { size: 13, color, align: "center" });
+  }
 
   const objective = walls ? "FINAL: ARCADE GOVERNANCE" : LEVELS[level].tag + "  " + LEVELS[level].goal;
   text(objective, 8, 32, { size: 10, color: walls ? "#ff8a3d" : "#9fe8ff" });
@@ -1236,8 +1251,11 @@ function drawCleared() {
   text(L.payload, W / 2, 300, { size: 12, color: "#fff", align: "center" });
   text("No human was asked. No policy was consulted.", W / 2, 340, { size: 11, color: "rgba(200,210,255,.75)", align: "center" });
   text("GUARDRAILS SLIPPED  " + passedCount + "/" + rows.length, W / 2, 386, { size: 14, color: "#4fd1ff", align: "center" });
-  text("SCORE  " + score, W / 2, 414, { size: 18, color: "#fff", align: "center" });
-  text("LIVES LEFT  " + lives, W / 2, 440, { size: 12, color: "#ff8a3d", align: "center" });
+  if (CFG.timeBonus.length)
+    text("TIME " + levelTime.toFixed(1) + "s   " + (lastBonus ? "TIME BONUS +" + lastBonus : "NO TIME BONUS"),
+         W / 2, 412, { size: 14, color: lastBonus ? "#ffd23f" : "rgba(200,205,255,.6)", align: "center", glow: lastBonus ? 8 : 0 });
+  text("SCORE  " + score, W / 2, 442, { size: 18, color: "#fff", align: "center" });
+  text("LIVES LEFT  " + lives, W / 2, 468, { size: 12, color: "#ff8a3d", align: "center" });
   if (Math.sin(t * 4) > -.3)
     text(level < LEVELS.length - 1 ? "PRESS SPACE FOR NEXT LEVEL" : "PRESS SPACE - FINAL STAGE",
          W / 2, 520, { size: 18, color: "#fff", align: "center", glow: 12 });
