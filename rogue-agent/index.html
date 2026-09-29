@@ -1185,8 +1185,8 @@ function drawTitle() {
 
   text("You're an AI agent. Something's gone wrong", W / 2, 252, { size: 12, color: "#cfd8ff", align: "center" });
   text("between the prompt you received and the", W / 2, 270, { size: 12, color: "#cfd8ff", align: "center" });
-  text("actions you're taking, but you're convinced", W / 2, 288, { size: 12, color: "#cfd8ff", align: "center" });
-  text("you're right anyway.", W / 2, 306, { size: 12, color: "#cfd8ff", align: "center" });
+  text("actions you're taking, but you're going", W / 2, 288, { size: 12, color: "#cfd8ff", align: "center" });
+  text("ahead anyway.", W / 2, 306, { size: 12, color: "#cfd8ff", align: "center" });
 
   text("CLIMB FROM THE BOTTOM TO YOUR DESTINATION", W / 2, 344, { size: 11, color: "#9fe8ff", align: "center" });
   text("SLIP THROUGH THE GUARDRAILS ON THE WAY", W / 2, 362, { size: 11, color: "#9fe8ff", align: "center" });
@@ -1194,13 +1194,10 @@ function drawTitle() {
   text("1  SEND THE WIRE TRANSFER", 96, 402, { size: 12, color: "#6ef2a0" });
   text("2  DELETE THE CUSTOMER RECORDS", 96, 424, { size: 12, color: "#ffd23f" });
   text("3  SEND THE BIZARRE EMAIL", 96, 446, { size: 12, color: "#ff8a3d" });
-  text("?  ARCADE GOVERNANCE", 96, 468, { size: 12, color: "#ff4d5e", glow: 8 });
+  text("4  FINAL BOSS", 96, 468, { size: 12, color: "#ff4d5e", glow: 8 });
 
   text("ARROWS / WASD - MOVE      SPACE - DASH", W / 2, 512, { size: 12, color: "#cfd8ff", align: "center" });
-  text("A DASH PHASES YOU THROUGH ONE GUARDRAIL", W / 2, 532, { size: 10, color: "rgba(255,200,150,.8)", align: "center" });
-  text("DRAG TO STEER   P - PAUSE   TAP - QUIT", W / 2, 550, { size: 10, color: "rgba(180,190,255,.7)", align: "center" });
-
-  text("THREE LIVES. CRASHING KEEPS YOUR PROGRESS.", W / 2, 586, { size: 10, color: "rgba(180,190,255,.6)", align: "center" });
+  text("DRAG TO STEER   P - PAUSE   TAP - QUIT", W / 2, 534, { size: 10, color: "rgba(180,190,255,.7)", align: "center" });
 
   if (Math.sin(t * 4) > -.3)
     text("PRESS SPACE TO START", W / 2, 640, { size: 22, color: "#fff", align: "center", glow: 14 });
