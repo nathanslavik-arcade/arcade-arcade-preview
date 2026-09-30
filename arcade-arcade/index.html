@@ -313,16 +313,6 @@
   .cab:hover .slot,.cab.sel .slot{border-color:#12072e;background:#12072e}
   .cab.sel{filter:drop-shadow(0 0 22px color-mix(in srgb,var(--c) 55%,transparent))}
 
-  /* Coming-soon cabinet */
-  .cab.soon{cursor:default}
-  .cab.soon .top span{color:var(--dim);text-shadow:none}
-  .static{
-    width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
-    background:#08051a;position:relative;
-  }
-  .static canvas{position:absolute;inset:0;width:100%;height:100%;opacity:.22}
-  .static p{position:relative;font-size:11px;color:var(--amber);text-shadow:0 0 8px var(--amber);letter-spacing:2px}
-  .static small{position:relative;font-size:8px;color:var(--dim);letter-spacing:1px}
 
   /* ---------- HALL OF FAME ---------- */
   .fame{padding:40px 20px 110px;text-align:center;background:var(--night)}
@@ -527,36 +517,7 @@ GAMES.forEach((g, i) => {
   row.appendChild(a);
 });
 
-const soon = document.createElement("div");
-soon.className = "cab soon";
-soon.style.setProperty("--c", "#6b5aa0");
-soon.innerHTML = `
-  <div class="num">GAME 04</div>
-  <div class="top"><span>COMING SOON</span></div>
-  <div class="body">
-    <div class="screen"><div class="static"><canvas id="noise" width="160" height="120"></canvas><p>LOADING...</p><small>NEXT CABINET IN THE SHOP</small></div></div>
-    <div class="panel">
-      <div class="controls"><div class="stick"></div><div class="btns"><i></i><i></i><i></i></div><div class="keys">??? / ???<br>???</div></div>
-      <div class="blurb">A new cabinet is being wired up. Check back soon.</div>
-      <div class="tags"><b>TBA</b></div>
-    </div>
-  </div>
-  <div class="base"><span class="slot"></span>OUT OF ORDER<span class="slot"></span></div>`;
-row.appendChild(soon);
-
-// ---- TV static on the coming-soon screen ----
-const nc = document.getElementById("noise"), nx = nc.getContext("2d");
 const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-function noise() {
-  const d = nx.createImageData(nc.width, nc.height);
-  for (let p = 0; p < d.data.length; p += 4) {
-    const v = Math.random() * 255 | 0;
-    d.data[p] = d.data[p + 1] = d.data[p + 2] = v; d.data[p + 3] = 255;
-  }
-  nx.putImageData(d, 0, 0);
-  if (!reduced) setTimeout(() => requestAnimationFrame(noise), 70);
-}
-noise();
 
 // ---- stars ----
 const stars = document.getElementById("stars");
