@@ -1,0 +1,1250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>SHADOW AGENTS</title>
+<style>
+  :root { --bezel:#15121f; --glow:#ffd98a; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body {
+    height:100%; background:#05040d; overflow:hidden;
+    font-family:"Courier New",monospace; color:#cfd8ff;
+    display:flex; align-items:center; justify-content:center;
+    touch-action:none; user-select:none; -webkit-user-select:none;
+  }
+  #cabinet {
+    position:relative; padding:14px; border-radius:18px;
+    background:linear-gradient(180deg,#241d34,#100c1c);
+    box-shadow:0 0 0 2px #372b52, 0 30px 70px rgba(0,0,0,.8), 0 0 90px rgba(255,217,138,.08);
+  }
+  #wrap { position:relative; line-height:0; border-radius:8px; overflow:hidden; }
+  canvas {
+    display:block; image-rendering:pixelated; background:#07061a;
+    height:min(94vh, 720px); width:auto;
+  }
+  /* CRT scanlines + vignette */
+  #wrap::after {
+    content:""; position:absolute; inset:0; pointer-events:none;
+    background:
+      repeating-linear-gradient(0deg, rgba(0,0,0,.26) 0 1px, rgba(0,0,0,0) 1px 3px),
+      radial-gradient(120% 100% at 50% 50%, rgba(0,0,0,0) 55%, rgba(0,0,0,.55) 100%);
+    mix-blend-mode:multiply;
+  }
+  #marquee {
+    text-align:center; letter-spacing:.42em; font-size:11px; font-weight:bold;
+    color:#7f6fb8; padding:0 0 10px 2px; text-transform:uppercase;
+  }
+</style>
+</head>
+<body>
+<div id="cabinet">
+  <div id="marquee">Shadow Agents</div>
+  <div id="wrap"><canvas id="game" width="480" height="720"></canvas></div>
+</div>
+<script>
+(() => {
+"use strict";
+
+/* ────────────────────────── setup ────────────────────────── */
+const W = 480, H = 720;
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const HI_KEY = "shadowAgents.hiscore";
+// [PLACEHOLDER] local dev server; swap for the deployed Worker URL before publishing
+const LEADERBOARD_API = "https://arcade-leaderboard.nathanslavik.workers.dev";
+const rand  = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const pick  = a => a[randi(0, a.length - 1)];
+
+/* ────────────────────────── audio ────────────────────────── */
+let ac = null;
+const audio = () => (ac ||= new (window.AudioContext || window.webkitAudioContext)());
+function tone(freq, dur, { type = "square", vol = .07, to = null, delay = 0 } = {}) {
+  if (!ac) return;
+  const t0 = ac.currentTime + delay;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t0);
+  if (to) o.frequency.exponentialRampToValueAtTime(Math.max(30, to), t0 + dur);
+  g.gain.setValueAtTime(0, t0);
+  g.gain.linearRampToValueAtTime(vol, t0 + .008);
+  g.gain.exponentialRampToValueAtTime(.0001, t0 + dur);
+  o.connect(g).connect(ac.destination);
+  o.start(t0); o.stop(t0 + dur + .02);
+}
+function noise(dur, vol = .12) {
+  if (!ac) return;
+  const n = Math.floor(ac.sampleRate * dur);
+  const buf = ac.createBuffer(1, n, ac.sampleRate), d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const s = ac.createBufferSource(), g = ac.createGain();
+  s.buffer = buf; g.gain.value = vol;
+  s.connect(g).connect(ac.destination); s.start();
+}
+const sfx = {
+  start:  () => [0, 1, 2].forEach(i => tone([392, 523, 784][i], .12, { delay: i * .09, vol: .08 })),
+  found:  () => { [0, 1, 2].forEach(i => tone([660, 880, 1320][i], .10, { delay: i * .05, vol: .07, type: "triangle" })); noise(.12, .05); },
+  lock:   () => tone(1400, .03, { vol: .025, type: "sine" }),
+  alarm:  () => [0, 1].forEach(i => tone([880, 660][i], .12, { delay: i * .13, vol: .045, type: "square" })),
+  down:   () => { tone(220, .35, { to: 70, vol: .08, type: "sawtooth" }); noise(.2, .06); },
+  pellet: () => [0, 1, 2].forEach(i => tone([1046, 1319, 1568][i], .08, { delay: i * .06, vol: .04, type: "sine" })),
+  reveal: () => { tone(200, .9, { to: 2400, vol: .08, type: "sawtooth" }); [0, 1, 2, 3, 4].forEach(i => tone([523, 659, 784, 1046, 1319][i], .2, { delay: .3 + i * .08, vol: .07, type: "triangle" })); },
+  clear:  () => [0, 1, 2, 3, 4].forEach(i => tone([523, 659, 784, 1046, 1319][i], .16, { delay: i * .07, vol: .08, type: "triangle" })),
+  breach: () => { [0, 1, 2].forEach(i => tone([330, 262, 175][i], .26, { delay: i * .13, vol: .09, type: "sawtooth" })); noise(.3, .08); },
+  over:   () => [0, 1, 2, 3].forEach(i => tone([392, 330, 262, 175][i], .3, { delay: i * .16, vol: .1, type: "sawtooth" })),
+};
+
+/* ─────────────── leaderboard ───────────────
+   Shared by every Arcade Arcade canvas game. Source of truth lives in
+   arcade-leaderboard/client/leaderboard.js; `bun client/sync.js` pastes it into each game.
+   The game supplies its own `text()` so the board matches its look.
+
+     const lb = createLeaderboard({ api, game, ctx, W, text, accent, sfx });
+     lb.start()          when a run begins (asks the server for a run id)
+     lb.finish(score)    when a run ends (loads the board, opens initials entry if it placed)
+     lb.busy             true while loading / entering initials / sending: don't restart yet
+     lb.key(e)           returns true if the leaderboard used the key
+     lb.tap(x, y)        canvas coords; returns true if the leaderboard used the tap
+     lb.draw(y0)         draws the panel from y0 downward (about 330px tall)            */
+function createLeaderboard({ api, game, ctx, W, text, accent = "#ffd23f", sfx = {} }) {
+  const ABC = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const TOP = 10;
+  let run = null, phase = null, top = [], score = 0, rank = 0, mineId = null, note = "";
+  let letters = [0, 0, 0], cur = 0, boxes = [], okBox = null, openedAt = 0;
+  // Button-mashers hit Space through game over; ignore input for a beat after entry opens
+  const settling = () => performance.now() - openedAt < 800;
+
+  const post = (path, body) => fetch(api + path, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }).then(r => r.json().then(j => ({ ok: r.ok, ...j })));
+
+  const qualifies = s => s > 0 && (top.length < TOP || s > top[top.length - 1].score);
+  const beep = f => { try { sfx.tone && sfx.tone(f); } catch (_) {} };
+
+  function start() {
+    run = null;
+    if (!api) return;
+    post("/runs", { game }).then(r => { if (r.run) run = r.run; }).catch(() => {});
+  }
+
+  function finish(s) {
+    score = s; rank = 0; mineId = null; note = ""; cur = 0;
+    if (!api) { phase = "offline"; return; }
+    phase = "loading";
+    fetch(api + "/scores?game=" + encodeURIComponent(game))
+      .then(r => r.json())
+      .then(j => {
+        top = j.top || [];
+        phase = run && qualifies(score) ? "entry" : "board";
+        openedAt = performance.now();
+        if (phase === "board" && score > 0 && !run && qualifies(score)) note = "SCORE NOT RECORDED";
+      })
+      .catch(() => { phase = "offline"; });
+  }
+
+  function submit() {
+    phase = "sending";
+    const initials = letters.map(i => ABC[i]).join("");
+    post("/scores", { run, initials, score })
+      .then(r => {
+        if (r.code === "blocked") { phase = "entry"; cur = 0; note = "PICK DIFFERENT INITIALS"; openedAt = performance.now(); return; }
+        if (!r.ok) { phase = "board"; note = "SCORE NOT RECORDED"; return; }
+        top = r.top; rank = r.rank; mineId = r.id; run = null; note = ""; phase = "board";
+        sfx.saved && sfx.saved();
+      })
+      .catch(() => { phase = "offline"; });
+  }
+
+  function nudge(d) { letters[cur] = (letters[cur] + d + 26) % 26; beep(520 + letters[cur] * 12); note = ""; }
+  function advance() { if (cur < 2) { cur++; beep(700); } else submit(); }
+
+  function key(e) {
+    if (phase === "loading" || phase === "sending") return true;
+    if (phase !== "entry") return false;
+    if (settling()) return true;
+    const k = e.key;
+    if (k === "ArrowUp") nudge(1);
+    else if (k === "ArrowDown") nudge(-1);
+    else if (k === "ArrowLeft") cur = Math.max(0, cur - 1);
+    else if (k === "ArrowRight") cur = Math.min(2, cur + 1);
+    else if (k === "Backspace") cur = Math.max(0, cur - 1);
+    else if (k === "Enter") advance();
+    else if (/^[a-z]$/i.test(k)) { letters[cur] = ABC.indexOf(k.toUpperCase()); note = ""; beep(640); if (cur < 2) cur++; }
+    else return true;
+    e.preventDefault && e.preventDefault();
+    return true;
+  }
+
+  function tap(x, y) {
+    if (phase === "loading" || phase === "sending") return true;
+    if (phase !== "entry") return false;
+    if (settling()) return true;
+    if (okBox && x > okBox.x && x < okBox.x + okBox.w && y > okBox.y && y < okBox.y + okBox.h) { submit(); return true; }
+    boxes.forEach((b, i) => {
+      if (x > b.x && x < b.x + b.w && y > b.y - 30 && y < b.y + b.h + 30) {
+        cur = i;
+        nudge(y < b.y + b.h / 2 ? 1 : -1);
+      }
+    });
+    return true;
+  }
+
+  function panel(y0, h) {
+    ctx.fillStyle = "rgba(8,6,26,.82)";
+    ctx.fillRect(40, y0, W - 80, h);
+    ctx.strokeStyle = accent; ctx.lineWidth = 2;
+    ctx.strokeRect(40.5, y0 + .5, W - 81, h - 1);
+  }
+
+  function draw(y0) {
+    const blink = Math.sin(performance.now() / 160) > -.2;
+    if (phase === "loading" || phase === "sending") {
+      text(phase === "loading" ? "LOADING HIGH SCORES..." : "SAVING...", W / 2, y0 + 40, { size: 14, color: accent, align: "center" });
+      return;
+    }
+    if (phase === "offline") {
+      text("LEADERBOARD OFFLINE", W / 2, y0 + 40, { size: 14, color: "rgba(200,205,255,.6)", align: "center" });
+      return;
+    }
+    if (phase === "entry") {
+      panel(y0, 250);
+      text("NEW TOP 10 SCORE!", W / 2, y0 + 40, { size: 22, color: accent, align: "center", glow: 14 });
+      text("ENTER YOUR INITIALS", W / 2, y0 + 68, { size: 12, color: "#cfd8ff", align: "center" });
+      boxes = [];
+      for (let i = 0; i < 3; i++) {
+        const bx = W / 2 - 96 + i * 66, by = y0 + 100, bw = 60, bh = 70;
+        boxes.push({ x: bx, y: by, w: bw, h: bh });
+        const on = i === cur;
+        ctx.fillStyle = on ? "rgba(255,255,255,.08)" : "rgba(0,0,0,.35)";
+        ctx.fillRect(bx, by, bw, bh);
+        if (on && blink) { ctx.fillStyle = accent; ctx.fillRect(bx + 8, by + bh - 8, bw - 16, 4); }
+        text(ABC[letters[i]], bx + bw / 2, by + 50, { size: 44, color: on ? "#fff" : "#9aa3cc", align: "center", glow: on ? 12 : 0 });
+        if (on) {
+          text("▲", bx + bw / 2, by - 8, { size: 14, color: accent, align: "center" });
+          text("▼", bx + bw / 2, by + bh + 20, { size: 14, color: accent, align: "center" });
+        }
+      }
+      okBox = { x: W / 2 - 50, y: y0 + 204, w: 100, h: 32 };
+      ctx.fillStyle = accent; ctx.fillRect(okBox.x, okBox.y, okBox.w, okBox.h);
+      text("OK", W / 2, okBox.y + 23, { size: 18, color: "#12072e", align: "center" });
+      text(note || "▲▼ LETTER   ◀▶ MOVE   ENTER OK", W / 2, y0 + 272,
+           { size: 10, color: note ? "#ff8fa3" : "rgba(200,205,255,.7)", align: "center" });
+      return;
+    }
+    if (phase === "board") {
+      const rows = Math.max(top.length, 1);
+      panel(y0, 58 + rows * 24);
+      text("TOP 10", W / 2, y0 + 34, { size: 22, color: accent, align: "center", glow: 12 });
+      if (!top.length) text("NO SCORES YET. BE THE FIRST.", W / 2, y0 + 68, { size: 12, color: "#cfd8ff", align: "center" });
+      top.forEach((r, i) => {
+        const y = y0 + 68 + i * 24, me = r.id === mineId;
+        if (me && !blink) return;
+        const c = me ? accent : i === 0 ? "#fff" : "#b9c2ee";
+        text(String(i + 1).padStart(2, " ") + ".", W / 2 - 110, y, { size: 15, color: c });
+        text(r.initials, W / 2 - 40, y, { size: 15, color: c, glow: me ? 8 : 0 });
+        text(String(r.score).padStart(7, " "), W / 2 + 110, y, { size: 15, color: c, align: "right" });
+      });
+      const foot = y0 + 82 + rows * 24;
+      if (note) text(note, W / 2, foot, { size: 11, color: "#ff8fa3", align: "center" });
+      else if (rank > TOP) text("YOU PLACED #" + rank, W / 2, foot, { size: 12, color: accent, align: "center" });
+      else if (!mineId && score > 0) text("YOUR SCORE " + score + " DIDN'T PLACE. TRY AGAIN.", W / 2, foot, { size: 11, color: "#cfd8ff", align: "center" });
+    }
+  }
+
+  return {
+    start, finish, key, tap, draw,
+    get busy() { return phase === "loading" || phase === "entry" || phase === "sending"; },
+    get phase() { return phase; },
+  };
+}
+/* ─────────────── /leaderboard ─────────────── */
+const lb = createLeaderboard({
+  api: LEADERBOARD_API, game: "shadow-agents", ctx, W, text, accent: "#ffd23f",
+  sfx: { tone: f => tone(f, .05, { vol: .05 }), saved: () => sfx.clear() },
+});
+
+/* ────────────────────────── tuning ───────────────────────── */
+const CFG = {
+  player:  { speed: 108, turn: 7 },            // px/s; turn = how far off a tile centre you can still corner
+  light:   { range: 82, half: .52, rays: 44, ambient: 22, catchTime: .30, dark: .80 },
+  lives:   3,
+  firstAgent: 1.5,                             // [TUNE] seconds before the first agent leaves the model
+  glimpse: 1.2,                                // seconds a new agent stays visible as it breaks out
+  // [TUNE] The Arcade power-up: seconds before the first one, between later ones, and how long each stays up
+  pellet:  { first: 40, every: 25, life: 8, minDist: 7 },
+  // [TUNE] Points. Agents found by the power-up score less than agents you hunted down yourself.
+  points:  { found: 200, revealed: 100, clear: 500, perSystem: 100 },
+  // [TUNE] Time bonus per cleared level: [under this many seconds, bonus points], fastest first. [] turns it off.
+  timeBonus: [[20, 1000], [40, 500], [60, 250]],
+};
+
+/* [TUNE] Difficulty by level (1-based). Every level adds an agent; they get faster, flee from further
+   away and eat systems quicker. Past the table it keeps scaling. */
+function levelCfg(n) {
+  const k = n - 1, mul = Math.min(1 + .09 * k, 1.7);
+  return {
+    agents:  Math.min(1 + n, 9),
+    seek:    50 * mul,                       // px/s while hunting for systems
+    flee:    84 * mul,                       // px/s while running from you (you do 108)
+    fleeR:   Math.min(3 + Math.floor(k / 2), 7),  // tiles: how close you get before they bolt
+    eatTime: Math.max(4.5, 8 - .4 * k),      // seconds to take a system down (crossing the maze takes you ~7s)
+    release: Math.max(1.5, 3.5 - .25 * k),   // seconds between agents leaving the model
+  };
+}
+
+const LEVELS = [
+  { title: "SHADOW AI",        brief: ["Someone connected an agent to the CRM.", "Nobody filed a ticket."] },
+  { title: "OVER-SCOPED",      brief: ["It asked for read access.", "Someone clicked \"allow all\"."] },
+  { title: "AGENT SPRAWL",     brief: ["Every team shipped an agent this quarter.", "You found out from the invoice."] },
+  { title: "LATERAL MOVEMENT", brief: ["They found the service accounts.", "They're using them."] },
+  { title: "NO AUDIT TRAIL",   brief: ["Nothing was logged.", "Nobody knows what ran, or when."] },
+];
+const levelInfo = n => LEVELS[n - 1] || { title: "IT KEEPS HAPPENING", brief: ["More agents. Same flashlight."] };
+
+/* ────────────────────────── the maze ─────────────────────── */
+const T = 24, COLS = 19, ROWS = 25, OX = 12, OY = 56;
+const MAZE = [
+  "###################",
+  "#........#........#",
+  "#.##.###.#.###.##.#",
+  "#.##.###.#.###.##.#",
+  "#.................#",
+  "#.##.#.#####.#.##.#",
+  "#....#...#...#....#",
+  "####.###.#.###.####",
+  "#..#.#.......#.#..#",
+  "#..#.#.##.##.#.#..#",
+  "#....#.#...#.#....#",
+  "#.##...#...#...##.#",
+  "#.##.#.#####.#.##.#",
+  "#....#.......#....#",
+  "####.#.#####.#.####",
+  "#........#........#",
+  "#.##.###.#.###.##.#",
+  "#..#...........#..#",
+  "##.#.#.#####.#.#.##",
+  "#....#...#...#....#",
+  "#.######.#.######.#",
+  "#.................#",
+  "#.##.###.#.###.##.#",
+  "#........#........#",
+  "###################",
+];
+const PEN = [[8, 10], [9, 10], [10, 10], [8, 11], [9, 11], [10, 11]];   // where the agents come from
+const START = [9, 21];
+const SYSTEMS = [
+  [1, 1, "CRM"], [17, 1, "PAYROLL"], [9, 4, "PROD DB"], [2, 9, "EMAIL"], [16, 9, "BILLING"],
+  [9, 13, "HR"], [1, 19, "CODE REPO"], [17, 19, "WIKI"], [4, 23, "CHAT"], [14, 23, "BACKUPS"],
+];
+
+const idx   = (c, r) => r * COLS + c;
+const open  = (c, r) => c >= 0 && r >= 0 && c < COLS && r < ROWS && MAZE[r][c] !== "#";
+const tcx   = c => OX + c * T + T / 2;
+const tcy   = r => OY + r * T + T / 2;
+const tileX = x => Math.floor((x - OX) / T);
+const tileY = y => Math.floor((y - OY) / T);
+const solidAt = (x, y) => !open(tileX(x), tileY(y));
+const DIR = { up: { x: 0, y: -1 }, down: { x: 0, y: 1 }, left: { x: -1, y: 0 }, right: { x: 1, y: 0 } };
+const DIRS = [DIR.up, DIR.left, DIR.down, DIR.right];
+
+function bfs(sources) {
+  const dist = new Int16Array(COLS * ROWS).fill(999);
+  const q = [];
+  for (const [c, r] of sources) { dist[idx(c, r)] = 0; q.push(c, r); }
+  for (let i = 0; i < q.length; i += 2) {
+    const c = q[i], r = q[i + 1], d = dist[idx(c, r)] + 1;
+    for (const v of DIRS) {
+      const nc = c + v.x, nr = r + v.y;
+      if (open(nc, nr) && dist[idx(nc, nr)] > d) { dist[idx(nc, nr)] = d; q.push(nc, nr); }
+    }
+  }
+  return dist;
+}
+function march(x, y, ang, max) {
+  const dx = Math.cos(ang), dy = Math.sin(ang);
+  for (let d = 2; d <= max; d += 2.5) if (solidAt(x + dx * d, y + dy * d)) return d;
+  return max;
+}
+function los(x0, y0, x1, y1) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 4);
+  for (let i = 1; i < n; i++) if (solidAt(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n)) return false;
+  return true;
+}
+
+/* the walls never move, so draw them once */
+const mazeCv = document.createElement("canvas");
+mazeCv.width = W; mazeCv.height = H;
+(() => {
+  const m = mazeCv.getContext("2d");
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const x = OX + c * T, y = OY + r * T;
+    if (open(c, r)) {
+      m.fillStyle = "rgba(120,140,255,.10)";
+      m.fillRect(x + T / 2 - 1, y + T / 2 - 1, 2, 2);
+      continue;
+    }
+    m.fillStyle = "#0e1236"; m.fillRect(x, y, T, T);
+    m.fillStyle = "#4f7bff";
+    if (open(c, r - 1)) m.fillRect(x, y + 3, T, 2);
+    if (open(c, r + 1)) m.fillRect(x, y + T - 5, T, 2);
+    if (open(c - 1, r)) m.fillRect(x + 3, y, 2, T);
+    if (open(c + 1, r)) m.fillRect(x + T - 5, y, 2, T);
+  }
+})();
+
+/* ────────────────────────── state ────────────────────────── */
+let state, player, agents, systems, parts, floats, dirKeys, pointer;
+let score, hiScore, lives, level, LC, t, levelTime, lastBonus, lastUptime;
+let flash, shake, banner, briefT, pellet, pelletT, reveal, viaPellet;
+let pDist, pTile, sysDist, sysDirty, light, ticker, found, totalFound, cleared;
+
+hiScore = +(localStorage.getItem(HI_KEY) || 0);
+dirKeys = [];
+pointer = null;
+
+const AGENT_COLORS = [
+  { body: "#ff4d5e", dark: "#a3162b" }, { body: "#ff7ad9", dark: "#9c2a7f" },
+  { body: "#4fe0ff", dark: "#1a7896" }, { body: "#ff9f3d", dark: "#9c5415" },
+  { body: "#b58cff", dark: "#5d38a8" }, { body: "#7dff8a", dark: "#2c8a37" },
+];
+
+function loadLevel(n) {
+  level = n; LC = levelCfg(n);
+  levelTime = 0; lastBonus = 0; found = 0;
+  player = { x: tcx(START[0]), y: tcy(START[1]), dir: null, face: DIR.up, ang: -Math.PI / 2, ph: 0, moving: false };
+  systems = SYSTEMS.map(([c, r, name]) => ({ c, r, name, down: false, eat: 0, eater: null, alarm: 0 }));
+  agents = [];
+  for (let i = 0; i < LC.agents; i++) {
+    const [c, r] = PEN[i % PEN.length];
+    agents.push({
+      c, r, nc: c, nr: r, pc: c, pr: r, x: tcx(c), y: tcy(r), vx: 0,
+      wait: CFG.firstAgent + i * LC.release, mode: "seek", sys: -1, expose: 0, lit: false, dead: false,
+      col: AGENT_COLORS[i % AGENT_COLORS.length], ph: rand(0, 6), blink: rand(1, 4),
+      id: "agent-" + Math.floor(rand(4096, 65535)).toString(16),
+    });
+  }
+  parts = []; floats = [];
+  pellet = null; pelletT = CFG.pellet.first + rand(0, 4); reveal = 0; viaPellet = false;
+  pTile = -1; sysDirty = true; banner = 1.6;
+  ticker = { text: "", color: "#fff", t: 0 };
+  updateLight();
+}
+
+function fullReset() {
+  score = 0; lives = CFG.lives; t = 0; totalFound = 0; cleared = 0;
+  flash = 0; shake = 0; briefT = 0;
+  loadLevel(1);
+}
+fullReset();
+state = "title";
+
+/* ────────────────────────── quit dialog ──────────────────── */
+/* A quick tap or click on the field (no drag) asks to quit. Drags still steer. */
+const TAP = { ms: 250, px: 10 };
+const QUIT_Y = { x: W / 2 - 96, y: H / 2 + 6, w: 84, h: 46 };
+const QUIT_N = { x: W / 2 + 12, y: H / 2 + 6, w: 84, h: 46 };
+const inBox = (p, b) => p.x > b.x && p.x < b.x + b.w && p.y > b.y && p.y < b.y + b.h;
+let tapStart = null;
+function askQuit() { state = "quit"; dirKeys = []; pointer = null; tone(330, .08, { vol: .05 }); }
+function resumeFromQuit() { state = "playing"; last = performance.now(); }
+function quitKey(e) {
+  const k = e.key.toLowerCase();
+  if (k === "y") { quitToArcade(); return true; }
+  if (k === "n" || k === "escape") { resumeFromQuit(); return true; }
+  return true;   // swallow everything else while the dialog is up
+}
+function quitTap(p) {
+  if (inBox(p, QUIT_Y)) quitToArcade();
+  else if (inBox(p, QUIT_N)) resumeFromQuit();
+}
+function drawQuit() {
+  overlay(.7);
+  text("QUIT?", W / 2, H / 2 - 40, { size: 44, color: "#fff", align: "center", glow: 16 });
+  for (const [b, label, c] of [[QUIT_Y, "Y", "#ff4d5e"], [QUIT_N, "N", "#6ef2a0"]]) {
+    ctx.fillStyle = "rgba(0,0,0,.45)"; ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.strokeRect(b.x + .5, b.y + .5, b.w - 1, b.h - 1);
+    text(label, b.x + b.w / 2, b.y + 33, { size: 26, color: c, align: "center", glow: 10 });
+  }
+  text("Y  BACK TO THE ARCADE      N  KEEP PLAYING", W / 2, H / 2 + 84, { size: 11, color: "rgba(200,205,255,.75)", align: "center" });
+}
+// Quit sends players back to The Arcade Arcade. Relative, so it works on GitHub Pages
+// (/<game>/ -> /arcade-arcade/) and on the local dev server. #games skips the coin.
+const ARCADE_URL = "../arcade-arcade/#games";
+function quitToArcade() { location.href = ARCADE_URL; }
+
+/* Under the high score board: Space retries, X (or tapping the exit line) goes back to the arcade */
+const EXIT_LINE = { x: 0, y: 682, w: W, h: 38 };
+function drawRetryExit() {
+  if (lb.busy) return;
+  if (Math.sin(t * 4) > -.3)
+    text("PRESS SPACE TO RETRY", W / 2, 664, { size: 17, color: "#fff", align: "center", glow: 12 });
+  text("PRESS X TO EXIT", W / 2, 698, { size: 14, color: "#ff8fa3", align: "center" });
+}
+
+/* ────────────────────────── input ────────────────────────── */
+const KEY_DIR = {
+  arrowup: DIR.up, w: DIR.up, arrowdown: DIR.down, s: DIR.down,
+  arrowleft: DIR.left, a: DIR.left, arrowright: DIR.right, d: DIR.right,
+};
+
+function startRun() { fullReset(); state = "brief"; briefT = 0; sfx.start(); lb.start(); }
+
+function confirmKey() {
+  if (state === "gameover") { if (!lb.busy) startRun(); return; }
+  if (state === "title")   { startRun(); return; }
+  if (state === "brief")   { state = "playing"; sfx.start(); last = performance.now(); return; }
+  if (state === "cleared") { loadLevel(level + 1); state = "brief"; briefT = 0; return; }
+  if (state === "breach")  { loadLevel(level); state = "brief"; briefT = 0; return; }
+  if (state === "paused")  { state = "playing"; return; }
+}
+
+addEventListener("keydown", e => {
+  audio();
+  if (state === "gameover" && lb.key(e)) return;
+  if (state === "gameover" && e.key.toLowerCase() === "x") { quitToArcade(); return; }
+  if (state === "quit") { quitKey(e); e.preventDefault(); return; }
+  if (e.key === "Escape" && state === "playing") { askQuit(); return; }
+  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", " "].includes(e.key)) e.preventDefault();
+  const d = KEY_DIR[e.key.toLowerCase()];
+  if (d) { dirKeys = dirKeys.filter(k => k !== d); dirKeys.push(d); }   // newest key wins
+  if (e.key === " " || e.key === "Enter") confirmKey();
+  if (e.key.toLowerCase() === "p" && (state === "playing" || state === "paused"))
+    state = state === "playing" ? "paused" : "playing";
+});
+addEventListener("keyup", e => {
+  const d = KEY_DIR[e.key.toLowerCase()];
+  if (d) dirKeys = dirKeys.filter(k => k !== d);
+});
+addEventListener("blur", () => { dirKeys = []; });
+
+function toCanvas(e) {
+  const r = cv.getBoundingClientRect();
+  return {
+    x: clamp((e.clientX - r.left) / r.width * W, 0, W),
+    y: clamp((e.clientY - r.top) / r.height * H, 0, H),
+  };
+}
+/* touch and mouse: press anywhere and drag, like a joystick */
+cv.addEventListener("pointermove", e => {
+  if (!pointer) return;
+  const p = toCanvas(e);
+  pointer.x = p.x; pointer.y = p.y;
+});
+cv.addEventListener("pointerdown", e => {
+  audio();
+  if (state === "quit") { quitTap(toCanvas(e)); return; }
+  if (state === "playing") {
+    const p = toCanvas(e);
+    pointer = { ox: p.x, oy: p.y, x: p.x, y: p.y };
+    tapStart = { x: e.clientX, y: e.clientY, t: performance.now() };
+    return;
+  }
+  if (state === "gameover") {
+    const p = toCanvas(e);
+    if (lb.tap(p.x, p.y)) return;
+    if (!lb.busy && inBox(p, EXIT_LINE)) { quitToArcade(); return; }
+  }
+  confirmKey();
+});
+cv.addEventListener("pointerup", e => {
+  pointer = null;
+  const s = tapStart; tapStart = null;
+  if (!s || state !== "playing") return;
+  if (performance.now() - s.t < TAP.ms && Math.hypot(e.clientX - s.x, e.clientY - s.y) < TAP.px) askQuit();
+});
+cv.addEventListener("pointerleave", () => { pointer = null; tapStart = null; });
+
+function wantDir() {
+  if (pointer) {
+    const dx = pointer.x - pointer.ox, dy = pointer.y - pointer.oy;
+    if (Math.hypot(dx, dy) < 14) return null;
+    return Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? DIR.right : DIR.left) : (dy > 0 ? DIR.down : DIR.up);
+  }
+  return dirKeys[dirKeys.length - 1] || null;
+}
+
+/* ────────────────────────── fx helpers ───────────────────── */
+function burst(x, y, color, spread = 3) {
+  parts.push({
+    x, y, color,
+    vx: rand(-70, 70) * spread * .35, vy: rand(-140, 40) * spread * .3,
+    life: rand(.28, .62), max: .62, size: randi(2, 4),
+  });
+}
+function pop(x, y, color) {
+  for (let i = 0; i < 18; i++) burst(x, y, i % 4 === 0 ? "#ffffff" : color, 3);
+}
+function float(x, y, text, color = "#fff") {
+  floats.push({ x: clamp(x, 6, W - 150), y, text, color, life: 1.1 });
+}
+function say(text, color = "#ff8fa3") { ticker = { text, color, t: 3.2 }; }
+
+/* ────────────────────────── the player ───────────────────── */
+function canGo(d) {
+  const c = tileX(player.x), r = tileY(player.y), cx = tcx(c), cy = tcy(r);
+  if (d.x && Math.abs(player.y - cy) > .5) return false;
+  if (d.y && Math.abs(player.x - cx) > .5) return false;
+  if (open(c + d.x, r + d.y)) return true;
+  return d.x ? (cx - player.x) * d.x > .5 : (cy - player.y) * d.y > .5;   // room left before the wall
+}
+
+function movePlayer(dt) {
+  const p = player, want = wantDir();
+  const c = tileX(p.x), r = tileY(p.y), cx = tcx(c), cy = tcy(r);
+  let d = null;
+  if (want) {
+    const near = Math.abs(p.x - cx) <= CFG.player.turn && Math.abs(p.y - cy) <= CFG.player.turn;
+    if (canGo(want)) d = want;
+    else if (near && open(c + want.x, r + want.y)) { p.x = cx; p.y = cy; d = want; }   // corner
+    else if (p.dir && canGo(p.dir)) d = p.dir;                                           // turn is queued
+  }
+  p.dir = d; p.moving = !!d;
+  if (d) {
+    let nx = p.x + d.x * CFG.player.speed * dt, ny = p.y + d.y * CFG.player.speed * dt;
+    if (!open(c + d.x, r + d.y)) {
+      if (d.x) nx = d.x > 0 ? Math.min(nx, cx) : Math.max(nx, cx);
+      else ny = d.y > 0 ? Math.min(ny, cy) : Math.max(ny, cy);
+    }
+    p.x = nx; p.y = ny; p.face = d;
+    p.ph += dt * 12;
+  } else if (want) p.face = want;    // standing still, you can still point the light
+  const target = Math.atan2(p.face.y, p.face.x);
+  let diff = target - p.ang;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  p.ang += diff * Math.min(1, dt * 16);
+}
+
+/* ────────────────────────── the flashlight ───────────────── */
+function updateLight() {
+  const { x, y, ang } = player, R = CFG.light.range, h = CFG.light.half, n = CFG.light.rays;
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const a = ang - h + (2 * h) * i / n;
+    const d = march(x, y, a, R);
+    pts.push(x + Math.cos(a) * d, y + Math.sin(a) * d);
+  }
+  light = { x, y, pts };
+}
+function lightPath(g) {
+  g.beginPath();
+  g.moveTo(light.x, light.y);
+  for (let i = 0; i < light.pts.length; i += 2) g.lineTo(light.pts[i], light.pts[i + 1]);
+  g.closePath();
+  g.moveTo(light.x + CFG.light.ambient, light.y);
+  g.arc(light.x, light.y, CFG.light.ambient, 0, 6.283);
+}
+function isLit(x, y) {
+  const dx = x - player.x, dy = y - player.y, d = Math.hypot(dx, dy);
+  if (d < CFG.light.ambient) return true;
+  if (d > CFG.light.range + 6) return false;
+  let diff = Math.atan2(dy, dx) - player.ang;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  return Math.abs(diff) < CFG.light.half + .1 && los(player.x, player.y, x, y);
+}
+
+/* ────────────────────────── the agents ───────────────────── */
+function refreshMaps() {
+  const pt = idx(tileX(player.x), tileY(player.y));
+  if (pt !== pTile) { pTile = pt; pDist = bfs([[tileX(player.x), tileY(player.y)]]); }
+  if (sysDirty) {
+    sysDirty = false;
+    sysDist = bfs(systems.filter(s => !s.down && !s.eater).map(s => [s.c, s.r]));
+  }
+}
+const sysAt = (c, r) => systems.findIndex(s => s.c === c && s.r === r);
+const exposed = (c, r) => Math.hypot(tcx(c) - player.x, tcy(r) - player.y) < CFG.light.range * 1.6
+                          && los(player.x, player.y, tcx(c), tcy(r));
+
+function chooseNext(a, threat) {
+  let opts = DIRS.map(v => [a.c + v.x, a.r + v.y]).filter(([c, r]) => open(c, r));
+  const fwd = opts.filter(([c, r]) => c !== a.pc || r !== a.pr);
+  if (!threat && fwd.length) opts = fwd;          // hunting agents don't double back
+  let best = null, bestS = -Infinity;
+  for (const [c, r] of opts) {
+    let s;
+    if (threat) s = pDist[idx(c, r)] - (exposed(c, r) ? 2.5 : 0) + rand(0, .8);   // away, and out of sight
+    else s = -sysDist[idx(c, r)] + rand(0, .6) + (Math.random() < .08 ? 3 : 0);    // mostly toward food
+    if (s > bestS) { bestS = s; best = [c, r]; }
+  }
+  if (best) { a.nc = best[0]; a.nr = best[1]; }
+}
+
+function stepAgent(a, dt) {
+  a.ph += dt * 8;
+  a.blink -= dt;
+  if (a.blink < -.12) a.blink = rand(1.4, 4.5);
+  if (a.wait > 0) {
+    a.wait -= dt; a.y = tcy(a.r) + Math.sin(a.ph * .7) * 3;
+    /* breaking out of the model: you get a glimpse and an alert, then it's gone into the dark */
+    if (a.wait <= 0) { a.glimpse = CFG.glimpse; say("ROGUE AGENT DETECTED: " + a.id.toUpperCase()); sfx.alarm(); }
+    return;
+  }
+  a.glimpse = Math.max(0, (a.glimpse || 0) - dt);
+
+  const here = pDist[idx(a.c, a.r)];
+  const threat = a.lit || a.expose > 0 || here <= LC.fleeR;
+
+  if (a.mode === "eat") {
+    const s = systems[a.sys];
+    if (a.lit || here <= 2) { s.eater = null; a.mode = "seek"; sysDirty = true; }
+    else {
+      s.eat += dt / LC.eatTime;
+      if (s.eat >= 1) takeDown(s, a);
+      return;
+    }
+  }
+
+  /* spooked halfway down a corridor: turn round if that's away from you */
+  if (threat && pDist[idx(a.nc, a.nr)] < here) {
+    [a.c, a.r, a.nc, a.nr] = [a.nc, a.nr, a.c, a.r];
+    a.pc = a.nc; a.pr = a.nr;
+  }
+
+  const tx = tcx(a.nc), ty = tcy(a.nr);
+  const sp = (threat ? LC.flee : LC.seek) * dt;
+  const dx = tx - a.x, dy = ty - a.y, d = Math.hypot(dx, dy);
+  if (d > sp) { a.x += dx / d * sp; a.y += dy / d * sp; a.vx = dx / d * 60; return; }
+  a.x = tx; a.y = ty;
+  a.pc = a.c; a.pr = a.r; a.c = a.nc; a.r = a.nr;
+
+  const si = sysAt(a.c, a.r);
+  if (!threat && si >= 0 && !systems[si].down && !systems[si].eater) {
+    const s = systems[si];
+    a.mode = "eat"; a.sys = si; s.eater = a; sysDirty = true;
+    if (s.alarm <= 0) { say("ALERT: " + s.name + " ACCESSED BY " + a.id.toUpperCase()); sfx.alarm(); }
+    s.alarm = 1.2;
+    return;
+  }
+  chooseNext(a, threat);
+}
+
+function takeDown(s, a) {
+  s.down = true; s.eat = 1; s.eater = null; sysDirty = true;
+  a.mode = "seek";
+  shake = Math.max(shake, 5);
+  sfx.down();
+  say(s.name + " COMPROMISED", "#ff4d5e");
+  for (let i = 0; i < 14; i++) burst(tcx(s.c), tcy(s.r), pick(["#ff4d5e", "#ffd23f"]), 2);
+  if (systems.every(x => x.down)) breach();
+}
+
+function catchAgent(a, byPellet) {
+  a.dead = true;
+  if (a.mode === "eat" && systems[a.sys]) { systems[a.sys].eater = null; sysDirty = true; }
+  const gain = (byPellet ? CFG.points.revealed : CFG.points.found) * level;
+  score += gain; found++; totalFound++;
+  pop(a.x, a.y, a.col.body);
+  float(a.x - 40, a.y - 16, "FOUND +" + gain, "#ffd23f");
+  if (!byPellet) sfx.found();
+  if (!byPellet && agents.every(x => x.dead)) completeLevel();
+}
+
+/* ────────────────────────── the power-up ─────────────────── */
+function spawnPellet() {
+  const spots = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++)
+    if (open(c, r) && !PEN.some(([pc, pr]) => pc === c && pr === r) && pDist[idx(c, r)] >= CFG.pellet.minDist && pDist[idx(c, r)] < 999)
+      spots.push([c, r]);
+  if (!spots.length) return;
+  const [c, r] = pick(spots);
+  pellet = { c, r, life: CFG.pellet.life, t: 0 };
+  sfx.pellet();
+  say("ARCADE POWER-UP ONLINE. GO GET IT.", "#ffb347");
+}
+
+/* ────────────────────────── outcomes ─────────────────────── */
+function saveHi() { if (score > hiScore) { hiScore = score; localStorage.setItem(HI_KEY, hiScore); } }
+
+function completeLevel() {
+  state = "cleared";
+  cleared++;
+  lastUptime = systems.filter(s => !s.down).length;
+  const tier = CFG.timeBonus.find(([secs]) => levelTime < secs);
+  lastBonus = tier ? tier[1] : 0;
+  score += CFG.points.clear + lastUptime * CFG.points.perSystem + lastBonus;
+  saveHi();
+  sfx.clear();
+}
+
+function breach() {
+  lives--;
+  flash = .6; shake = 16;
+  saveHi();
+  if (lives <= 0) { state = "gameover"; sfx.over(); lb.finish(score); return; }
+  state = "breach";
+  sfx.breach();
+}
+
+/* ────────────────────────── update ───────────────────────── */
+function update(dt) {
+  t += dt;
+  flash = Math.max(0, flash - dt * 2.2);
+  shake = Math.max(0, shake - dt * 26);
+  banner = Math.max(0, banner - dt);
+  if (state === "brief") briefT += dt;
+
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.vy += 420 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    if ((p.life -= dt) <= 0) parts.splice(i, 1);
+  }
+  for (let i = floats.length - 1; i >= 0; i--) {
+    const f = floats[i];
+    f.y -= 30 * dt;
+    if ((f.life -= dt) <= 0) floats.splice(i, 1);
+  }
+
+  if (state !== "playing") return;
+  levelTime += dt;
+  ticker.t = Math.max(0, ticker.t - dt);
+  for (const s of systems) s.alarm = Math.max(0, s.alarm - dt);
+
+  /* full visibility: the light sweeps out from you and takes every agent with it */
+  if (reveal > 0) {
+    reveal += dt;
+    const R = (reveal - 1) * 700;
+    for (const a of agents) if (!a.dead && Math.hypot(a.x - player.x, a.y - player.y) < R) catchAgent(a, true);
+    if (reveal > 2.4) completeLevel();
+    return;
+  }
+
+  movePlayer(dt);
+  updateLight();
+  refreshMaps();
+
+  for (const a of agents) {
+    if (a.dead) continue;
+    stepAgent(a, dt);
+    if (state !== "playing") return;
+    a.lit = isLit(a.x, a.y);
+    if (a.lit) {
+      if (a.expose === 0) sfx.lock();
+      a.expose += dt;
+      if (a.expose >= CFG.light.catchTime) { catchAgent(a, false); if (state !== "playing") return; }
+    } else a.expose = Math.max(0, a.expose - dt * .6);
+  }
+
+  /* the power-up */
+  if (pellet) {
+    pellet.t += dt;
+    if ((pellet.life -= dt) <= 0) { pellet = null; pelletT = CFG.pellet.every; }
+    else if (Math.hypot(tcx(pellet.c) - player.x, tcy(pellet.r) - player.y) < 14) {
+      pellet = null; reveal = 1; viaPellet = true;
+      flash = .9; sfx.reveal();
+      say("FULL VISIBILITY. EVERY AGENT ACTION, ON THE RECORD.", "#ffd23f");
+    }
+  } else if ((pelletT -= dt) <= 0) {
+    spawnPellet();
+    if (!pellet) pelletT = 2;
+  }
+}
+
+/* ────────────────────────── drawing ──────────────────────── */
+function text(str, x, y, { size = 16, color = "#cfd8ff", align = "left", weight = "bold", glow = 0 } = {}) {
+  ctx.font = `${weight} ${size}px "Courier New",monospace`;
+  ctx.textAlign = align;
+  ctx.textBaseline = "alphabetic";
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+  ctx.shadowBlur = 0;
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#0c0a22"); g.addColorStop(1, "#05040f");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.drawImage(mazeCv, 0, 0);
+  /* the model the agents crawl out of */
+  text("MODEL", tcx(9), tcy(11) + 3, { size: 8, color: "rgba(255,120,140,.55)", align: "center" });
+}
+
+function drawSystem(s) {
+  const x = tcx(s.c), y = tcy(s.r);
+  const hot = s.eater && Math.sin(t * 18) > 0;
+  ctx.fillStyle = s.down ? "#1d1a2a" : hot ? "#5a1422" : "#2b3160";
+  ctx.fillRect(x - 8, y - 8, 16, 16);
+  ctx.fillStyle = s.down ? "#2c2838" : "#4a5290";
+  for (let i = 0; i < 3; i++) ctx.fillRect(x - 6, y - 6 + i * 5, 12, 2);
+}
+/* drawn over the dark: you always know where your systems are and how they're doing */
+function drawSystemStatus(s) {
+  const x = tcx(s.c), y = tcy(s.r);
+  if (s.down) {
+    ctx.strokeStyle = "rgba(255,77,94,.75)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x - 6, y - 6); ctx.lineTo(x + 6, y + 6); ctx.moveTo(x + 6, y - 6); ctx.lineTo(x - 6, y + 6); ctx.stroke();
+    return;
+  }
+  if (s.eater || s.alarm > 0) {
+    const a = .35 + .35 * Math.abs(Math.sin(t * 9));
+    ctx.strokeStyle = `rgba(255,77,94,${a})`; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, 13 + Math.sin(t * 9) * 2, 0, 6.283); ctx.stroke();
+  }
+  ctx.fillStyle = s.eater ? (Math.sin(t * 18) > 0 ? "#ff4d5e" : "#ffd23f") : "#6ef2a0";
+  ctx.fillRect(x + 3, y - 7, 3, 3);
+  if (s.eat > 0) {
+    ctx.fillStyle = "rgba(0,0,0,.6)"; ctx.fillRect(x - 9, y + 9, 18, 3);
+    ctx.fillStyle = "#ff4d5e"; ctx.fillRect(x - 9, y + 9, 18 * s.eat, 3);
+  }
+}
+
+function drawAgent(a) {
+  const r = 8, bob = a.wait > 0 ? 0 : Math.sin(a.ph) * 1.5;
+  const eating = a.mode === "eat";
+  ctx.save();
+  ctx.translate(a.x, a.y + bob);
+  if (eating) ctx.rotate(Math.sin(t * 26) * .12);
+  /* legs */
+  ctx.fillStyle = a.col.dark;
+  for (let i = 0; i < 3; i++) {
+    const lx = -r + 4 + i * (r - 4);
+    ctx.fillRect(lx - 1.5, r - 4, 3, 6 + Math.sin(a.ph * 1.6 + i) * 2);
+  }
+  /* body */
+  ctx.fillStyle = a.col.body;
+  ctx.beginPath(); ctx.ellipse(0, 0, r, r, 0, 0, 6.283); ctx.fill();
+  ctx.fillStyle = a.col.dark;
+  ctx.beginPath(); ctx.ellipse(0, r * .42, r * .62, r * .3, 0, 0, 6.283); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.35)"; ctx.fillRect(-r * .5, -r * .62, 3, 3);
+  /* horns */
+  for (const sx of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(sx * r * .78, -r * .48); ctx.lineTo(sx * r * .42, -r * 1.34); ctx.lineTo(sx * r * .18, -r * .60);
+    ctx.closePath(); ctx.fill();
+  }
+  /* eyes: wide open when your light is on them */
+  const open = a.blink > 0 || a.lit;
+  const ex = r * .36, ey = -r * .12, ew = r * .34, eh = open ? (a.lit ? r * .5 : r * .36) : 1.5;
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(-ex - ew / 2, ey - eh / 2, ew, eh);
+  ctx.fillRect(ex - ew / 2, ey - eh / 2, ew, eh);
+  if (open) {
+    ctx.fillStyle = "#1a0308";
+    const look = clamp(a.vx / 60, -1, 1) * 1.5;
+    ctx.fillRect(-ex - 1.5 + look, ey - 1.5, 3, 3);
+    ctx.fillRect(ex - 1.5 + look, ey - 1.5, 3, 3);
+  }
+  /* mouth: chomping while it eats, an O when it's caught in the light */
+  ctx.fillStyle = "#1a0308";
+  if (a.lit) { ctx.beginPath(); ctx.arc(0, r * .42, 2.2, 0, 6.283); ctx.fill(); }
+  else if (eating) ctx.fillRect(-3, r * .3, 6, Math.abs(Math.sin(t * 20)) * 3 + 1);
+  ctx.restore();
+}
+
+function drawPlayer() {
+  const p = player, x = p.x, y = p.y;
+  const walk = p.moving ? Math.sin(p.ph) : 0;
+  const fx = Math.cos(p.ang), fy = Math.sin(p.ang);
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.strokeStyle = "#f2f4ff"; ctx.lineWidth = 2; ctx.lineCap = "round";
+  /* legs */
+  ctx.beginPath();
+  ctx.moveTo(0, 3); ctx.lineTo(-3 - walk * 2, 10);
+  ctx.moveTo(0, 3); ctx.lineTo(3 + walk * 2, 10);
+  /* body */
+  ctx.moveTo(0, -4); ctx.lineTo(0, 3);
+  /* back arm */
+  ctx.moveTo(0, -2); ctx.lineTo(-fx * 4 - 1, 3);
+  ctx.stroke();
+  /* tie: this is a CISO */
+  ctx.fillStyle = "#ff8a3d"; ctx.fillRect(-1, -3, 2, 4);
+  /* head */
+  ctx.fillStyle = "#f2f4ff";
+  ctx.beginPath(); ctx.arc(0, -8, 3.6, 0, 6.283); ctx.fill();
+  /* flashlight arm */
+  const hx = fx * 7, hy = -2 + fy * 7;
+  ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(hx, hy); ctx.stroke();
+  ctx.save();
+  ctx.translate(hx, hy); ctx.rotate(p.ang);
+  ctx.fillStyle = "#6b7390"; ctx.fillRect(-1, -2, 6, 4);
+  ctx.fillStyle = "#fff4c2"; ctx.fillRect(5, -2.5, 2, 5);
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawPelletBadge(x, y, s) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(s, s);
+  const halo = ctx.createRadialGradient(0, 0, 4, 0, 0, 42);
+  halo.addColorStop(0, "rgba(255,180,90,.6)");
+  halo.addColorStop(1, "rgba(255,140,60,0)");
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(0, 0, 42, 0, 6.283); ctx.fill();
+  const grad = ctx.createLinearGradient(-20, -20, 20, 20);
+  grad.addColorStop(0, "#ffb347"); grad.addColorStop(1, "#ff6a2f");
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(-21, -21, 42, 42, 10); else ctx.rect(-21, -21, 42, 42);
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = "#1a0f04";
+  ctx.beginPath();
+  ctx.moveTo(0, -13); ctx.lineTo(12, 14); ctx.lineTo(5, 14);
+  ctx.lineTo(0, 1);   ctx.lineTo(-5, 14); ctx.lineTo(-12, 14);
+  ctx.closePath(); ctx.fill();
+  ctx.fillRect(-7, 5, 14, 3);
+  ctx.restore();
+}
+
+function drawPellet() {
+  if (!pellet) return;
+  if (pellet.life < 2 && Math.sin(t * 20) < 0) return;    // blinks before it's gone
+  drawPelletBadge(tcx(pellet.c), tcy(pellet.r) + Math.sin(pellet.t * 4) * 1.5, .44 + Math.sin(pellet.t * 6) * .03);
+}
+
+/* the dark, with a hole cut where your light is */
+const darkCv = document.createElement("canvas");
+darkCv.width = W; darkCv.height = H;
+const dctx = darkCv.getContext("2d");
+function drawDark() {
+  let alpha = CFG.light.dark;
+  if (reveal > 0) alpha *= clamp(1 - (reveal - 1) * 1.6, 0, 1);
+  if (alpha <= 0) return;
+  dctx.globalCompositeOperation = "source-over";
+  dctx.clearRect(0, 0, W, H);
+  dctx.fillStyle = `rgba(3,3,12,${alpha})`;
+  dctx.fillRect(0, OY, W, ROWS * T);
+  dctx.globalCompositeOperation = "destination-out";
+  const g = dctx.createRadialGradient(light.x, light.y, 4, light.x, light.y, CFG.light.range);
+  g.addColorStop(0, "rgba(0,0,0,1)"); g.addColorStop(.75, "rgba(0,0,0,.95)"); g.addColorStop(1, "rgba(0,0,0,.55)");
+  dctx.fillStyle = g;
+  lightPath(dctx);
+  dctx.fill();
+  ctx.drawImage(darkCv, 0, 0);
+
+  /* warm beam on top */
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  const b = ctx.createRadialGradient(light.x, light.y, 4, light.x, light.y, CFG.light.range);
+  b.addColorStop(0, "rgba(255,230,160,.42)"); b.addColorStop(.6, "rgba(255,215,130,.16)"); b.addColorStop(1, "rgba(255,210,120,.03)");
+  ctx.fillStyle = b;
+  lightPath(ctx);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawAgents() {
+  const all = reveal > 0 || state === "breach" || state === "gameover";
+  ctx.save();
+  if (!all) { lightPath(ctx); ctx.clip(); }
+  for (const a of agents) if (!a.dead) drawAgent(a);
+  ctx.restore();
+}
+/* over the dark, so a fresh breakout is actually visible */
+function drawGlimpses() {
+  if (reveal > 0 || state === "breach" || state === "gameover") return;
+  for (const a of agents) {
+    if (a.dead || !a.glimpse) continue;
+    ctx.globalAlpha = clamp(a.glimpse / CFG.glimpse, 0, 1) * (Math.sin(t * 30) > -.4 ? 1 : .4);
+    drawAgent(a);
+    ctx.globalAlpha = 1;
+  }
+}
+/* the lock-on ring, drawn over the dark */
+function drawLocks() {
+  for (const a of agents) {
+    if (a.dead || a.expose <= 0) continue;
+    const pct = clamp(a.expose / CFG.light.catchTime, 0, 1);
+    ctx.strokeStyle = "#ffd23f"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(a.x, a.y, 13, -Math.PI / 2, -Math.PI / 2 + pct * 6.283); ctx.stroke();
+  }
+}
+
+function drawHud() {
+  ctx.fillStyle = "rgba(6,4,20,.85)"; ctx.fillRect(0, 0, W, OY - 4);
+  text("SCORE " + String(score).padStart(6, "0"), 8, 18, { size: 13, color: "#6ef2a0" });
+  text("LEVEL " + level, W / 2, 18, { size: 13, color: "#9fe8ff", align: "center" });
+  text("HI " + String(hiScore).padStart(6, "0"), W - 8, 18, { size: 13, color: "#ffd23f", align: "right" });
+
+  const left = agents.filter(a => !a.dead).length;
+  text("ROGUE AGENTS " + left, 8, 40, { size: 11, color: left ? "#ff8fa3" : "#6ef2a0" });
+  if (CFG.timeBonus.length) {
+    const tier = CFG.timeBonus.findIndex(([secs]) => levelTime < secs);
+    const color = ["#6ef2a0", "#ffd23f", "#ff8a3d"][tier] || "rgba(180,190,255,.5)";
+    text("TIME " + levelTime.toFixed(1), W / 2, 40, { size: 11, color, align: "center" });
+  }
+  const up = systems.filter(s => !s.down).length;
+  const upColor = up > 6 ? "#6ef2a0" : up > 3 ? "#ffd23f" : "#ff4d5e";
+  text("SYSTEMS ONLINE " + up + "/" + systems.length, W - 8, 40, { size: 11, color: upColor, align: "right" });
+
+  /* bottom bar: lives, the alert ticker, the power-up */
+  const by = OY + ROWS * T + 4;
+  ctx.fillStyle = "rgba(6,4,20,.85)"; ctx.fillRect(0, by, W, H - by);
+  if (ticker.t > 0) {
+    ctx.globalAlpha = Math.min(1, ticker.t * 2);
+    text(ticker.text, W / 2, by + 20, { size: 10, color: ticker.color, align: "center", glow: 6 });
+    ctx.globalAlpha = 1;
+  } else if (state === "playing" && !reveal) {
+    text("SHINE THE LIGHT ON THEM", W / 2, by + 20, { size: 10, color: "rgba(180,190,255,.45)", align: "center" });
+  }
+  for (let i = 0; i < lives; i++) {
+    const lx = 16 + i * 18, ly = by + 44;
+    ctx.fillStyle = "#f2f4ff"; ctx.beginPath(); ctx.arc(lx, ly - 4, 4, 0, 6.283); ctx.fill();
+    ctx.fillStyle = "#ff8a3d"; ctx.fillRect(lx - 1, ly + 1, 2, 5);
+  }
+  if (pellet) {
+    drawPelletBadge(W - 120, by + 41, .26);
+    text("POWER-UP  " + Math.ceil(pellet.life) + "s", W - 8, by + 45, { size: 11, color: "#ffb347", align: "right", glow: 6 });
+  }
+
+  if (banner > 0 && state === "playing") {
+    ctx.globalAlpha = Math.min(1, banner * 1.5);
+    text(levelInfo(level).title, W / 2, H / 2 - 50, { size: 32, color: "#ffd98a", align: "center", glow: 20 });
+    text("FIND THEM.", W / 2, H / 2 - 18, { size: 14, color: "#cfd8ff", align: "center" });
+    ctx.globalAlpha = 1;
+  }
+}
+
+function overlay(alpha = .74) {
+  ctx.fillStyle = `rgba(4,3,14,${alpha})`;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawTitle() {
+  overlay(.72);
+  const bob = Math.sin(t * 2) * 4;
+  text("SHADOW", W / 2, 140 + bob, { size: 60, color: "#ffd98a", align: "center", glow: 26 });
+  text("AGENTS", W / 2, 196 + bob, { size: 60, color: "#ff4d5e", align: "center", glow: 26 });
+
+  text("You're the CISO. Rogue agents are loose", W / 2, 244, { size: 12, color: "#cfd8ff", align: "center" });
+  text("in your systems, eating them one by one,", W / 2, 262, { size: 12, color: "#cfd8ff", align: "center" });
+  text("and you can't see a thing.", W / 2, 280, { size: 12, color: "#cfd8ff", align: "center" });
+
+  text("SHINE YOUR FLASHLIGHT ON AN AGENT TO STOP IT", W / 2, 322, { size: 11, color: "#9fe8ff", align: "center" });
+  text("LOSE ALL TEN SYSTEMS AND IT'S A BREACH.", W / 2, 340, { size: 11, color: "#ff8fa3", align: "center" });
+
+  drawPelletBadge(96, 408, .5);
+  text("THE ARCADE POWER-UP", 124, 404, { size: 12, color: "#ffb347", glow: 8 });
+  text("FULL VISIBILITY. EVERY AGENT, FOUND.", 124, 420, { size: 10, color: "#ffd0a0" });
+
+  text("ARROWS / WASD - MOVE      P - PAUSE", W / 2, 488, { size: 12, color: "#cfd8ff", align: "center" });
+  text("DRAG TO MOVE   TAP - QUIT", W / 2, 510, { size: 10, color: "rgba(180,190,255,.7)", align: "center" });
+
+  if (Math.sin(t * 4) > -.3)
+    text("PRESS SPACE TO START", W / 2, 620, { size: 22, color: "#fff", align: "center", glow: 14 });
+  text("HI-SCORE " + String(hiScore).padStart(6, "0"), W / 2, 672, { size: 13, color: "#ffd23f", align: "center" });
+}
+
+function drawBrief() {
+  overlay(.84);
+  const info = levelInfo(level);
+  text("LEVEL " + level, W / 2, 180, { size: 14, color: "rgba(180,190,255,.8)", align: "center" });
+  text(info.title, W / 2, 230, { size: info.title.length > 13 ? 30 : 36, color: "#ffd98a", align: "center", glow: 20 });
+  info.brief.forEach((s, i) => text(s, W / 2, 290 + i * 22, { size: 12, color: "#cfd8ff", align: "center" }));
+  text("ROGUE AGENTS", W / 2, 400, { size: 11, color: "rgba(180,190,255,.7)", align: "center" });
+  text(String(LC.agents), W / 2, 438, { size: 34, color: "#ff4d5e", align: "center", glow: 14 });
+  if (level === 1) text("SYSTEMS TO PROTECT  10", W / 2, 474, { size: 12, color: "#9fe8ff", align: "center" });
+  if (Math.sin(t * 4) > -.3)
+    text("PRESS SPACE", W / 2, 580, { size: 20, color: "#fff", align: "center", glow: 12 });
+}
+
+function drawCleared() {
+  overlay(.82);
+  text(viaPellet ? "FULL VISIBILITY" : "ALL AGENTS FOUND", W / 2, 200, { size: 32, color: viaPellet ? "#ffb347" : "#6ef2a0", align: "center", glow: 20 });
+  if (viaPellet)
+    text("Arcade put every agent action on the record.", W / 2, 236, { size: 11, color: "rgba(210,220,255,.8)", align: "center" });
+  text("AGENTS FOUND  " + found, W / 2, 292, { size: 14, color: "#ff8fa3", align: "center" });
+  text("SYSTEMS ONLINE  " + lastUptime + "/10   +" + lastUptime * CFG.points.perSystem, W / 2, 318, { size: 14, color: "#6ef2a0", align: "center" });
+  if (CFG.timeBonus.length)
+    text("TIME " + levelTime.toFixed(1) + "s   " + (lastBonus ? "TIME BONUS +" + lastBonus : "NO TIME BONUS"),
+         W / 2, 344, { size: 14, color: lastBonus ? "#ffd23f" : "rgba(200,205,255,.6)", align: "center", glow: lastBonus ? 8 : 0 });
+  text("SCORE  " + score, W / 2, 390, { size: 20, color: "#fff", align: "center" });
+  text("LIVES  " + lives, W / 2, 416, { size: 12, color: "#ff8a3d", align: "center" });
+  if (Math.sin(t * 4) > -.3)
+    text("PRESS SPACE FOR LEVEL " + (level + 1), W / 2, 500, { size: 18, color: "#fff", align: "center", glow: 12 });
+}
+
+function drawBreach() {
+  overlay(.8);
+  text("BREACH", W / 2, 240, { size: 64, color: "#ff3355", align: "center", glow: 26 });
+  text("All ten systems are compromised.", W / 2, 280, { size: 12, color: "rgba(210,220,255,.85)", align: "center" });
+  text("AGENTS FOUND  " + found + " / " + agents.length, W / 2, 336, { size: 14, color: "#ff8fa3", align: "center" });
+  text("LIVES LEFT  " + lives, W / 2, 362, { size: 14, color: "#ff8a3d", align: "center" });
+  if (Math.sin(t * 4) > -.3)
+    text("PRESS SPACE TO TRY LEVEL " + level + " AGAIN", W / 2, 460, { size: 16, color: "#fff", align: "center", glow: 12 });
+}
+
+function drawGameOver() {
+  overlay(.84);
+  text("BREACHED", W / 2, 110, { size: 44, color: "#ff3355", align: "center", glow: 24 });
+  text("The board would like a word.", W / 2, 142, { size: 12, color: "rgba(210,220,255,.8)", align: "center" });
+  text("SCORE " + score, W / 2, 186, { size: 24, color: "#fff", align: "center" });
+  text("AGENTS FOUND  " + totalFound, W / 2, 216, { size: 13, color: "#ff8fa3", align: "center" });
+  text("LEVELS CLEARED  " + cleared, W / 2, 238, { size: 13, color: "#6ef2a0", align: "center" });
+  lb.draw(276);
+  drawRetryExit();
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.save();
+  if (shake > .2) ctx.translate(rand(-shake, shake), rand(-shake, shake));
+
+  drawBackground();
+  for (const s of systems) drawSystem(s);
+  drawAgents();
+  drawDark();
+  drawGlimpses();
+  for (const s of systems) drawSystemStatus(s);
+  drawPellet();
+  drawLocks();
+  drawPlayer();
+
+  for (const p of parts) {
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x, p.y, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+  for (const f of floats) {
+    ctx.globalAlpha = clamp(f.life / .6, 0, 1);
+    text(f.text, f.x, f.y, { size: 12, color: f.color, glow: 6 });
+  }
+  ctx.globalAlpha = 1;
+
+  drawHud();
+  ctx.restore();
+
+  if (flash > 0) {
+    ctx.fillStyle = `rgba(255,244,210,${Math.min(.85, flash)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (state === "title")    drawTitle();
+  if (state === "brief")    drawBrief();
+  if (state === "cleared")  drawCleared();
+  if (state === "breach")   drawBreach();
+  if (state === "gameover") drawGameOver();
+  if (state === "quit")     drawQuit();
+  if (state === "paused") {
+    overlay(.6);
+    text("PAUSED", W / 2, H / 2, { size: 40, color: "#fff", align: "center", glow: 16 });
+    text("PRESS P OR SPACE", W / 2, H / 2 + 36, { size: 14, color: "#cfd8ff", align: "center" });
+  }
+}
+
+/* ────────────────────────── loop ─────────────────────────── */
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
