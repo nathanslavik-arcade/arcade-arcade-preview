@@ -270,7 +270,7 @@ const lb = createLeaderboard({
 /* ────────────────────────── tuning ───────────────────────── */
 const CFG = {
   player:  { speed: 108, turn: 7 },            // px/s; turn = how far off a tile centre you can still corner
-  light:   { range: 82, half: .52, rays: 44, ambient: 22, catchTime: .30, dark: .80 },
+  light:   { range: 80, half: .50, rays: 44, ambient: 22, catchTime: .40, dark: .80 },
   lives:   3,
   firstAgent: 1.5,                             // [TUNE] seconds before the first agent leaves the model
   glimpse: 1.2,                                // seconds a new agent stays visible as it breaks out
@@ -291,7 +291,7 @@ function levelCfg(n) {
     seek:    50 * mul,                       // px/s while hunting for systems
     flee:    84 * mul,                       // px/s while running from you (you do 108)
     fleeR:   Math.min(3 + Math.floor(k / 2), 7),  // tiles: how close you get before they bolt
-    eatTime: Math.max(4.5, 8 - .4 * k),      // seconds to take a system down (crossing the maze takes you ~7s)
+    eatTime: Math.max(4, 7 - .4 * k),        // seconds to take a system down (crossing the maze takes you ~7s)
     release: Math.max(1.5, 3.5 - .25 * k),   // seconds between agents leaving the model
   };
 }
