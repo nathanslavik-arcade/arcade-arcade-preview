@@ -1,7 +1,10 @@
-# The Arcade Arcade: team preview
+# The Arcade Arcade: team preview (retired)
 
-A preview build of The Arcade Arcade hub plus Guardrail Blocker, Rogue Agent and Shadow Agents,
-so the team can test before the live game URLs change.
+The Arcade Arcade is live at https://www.arcade.dev/arcade/ (ArcadeAI/www PR #634).
+Every page here now redirects to its arcade.dev twin.
 
-Built from the source repos next to this one with `./build.sh <leaderboard-api-url>`.
-Don't edit the copies here; edit the source and rebuild.
+`build.sh` is still the tool that builds the arcade.dev copy from the game sources next to this repo:
+
+    KEEP_ANALYTICS=1 ./build.sh /api/arcade-leaderboard ~/Desktop/<www checkout>/public/arcade
+
+Then open a PR on ArcadeAI/www. Don't edit `public/arcade/` by hand; edit the source and rebuild.
